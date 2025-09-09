@@ -1,452 +1,1144 @@
 """
-Главное приложение для системы отслеживания ног с камерой Intel RealSense D435f
-
-Автор: AI Assistant
-Версия: 1.0
+Основной скрипт для системы распознавания касаний с камерой Intel RealSense D435F
+Получает и отображает цветные изображения и изображения глубины
 """
 
 import cv2
+import numpy as np
+from typing import Optional, List, Dict, Any, Tuple
 import sys
-import argparse
-from typing import Optional
-
-# Импорт модулей системы
-from realsense_camera import RealSenseManager
-from foot_tracker import FootTracker
-from visualization import VisualizationManager
-from calibration import InteractiveCalibrator
-from config import ConfigManager
+import logging
+from realsense_camera import RealSenseCamera
+from calibrate_projection_area import ProjectionCalibrator
+from crop_to_calibrated_area import ProjectionAreaCropper
+from touch_processor import TouchProcessor
+from unity_communication import UnityCommunication
 
 
-class FootTrackingApp:
-    """Главное приложение для отслеживания ног"""
+class TouchDetector:
+    """
+    Класс для детекции касаний на проекции
+    """
     
-    def __init__(self) -> None:
-        self.tracker: Optional[FootTracker] = None
-        self.visualizer: Optional[VisualizationManager] = None
-        self.running = False
+    def __init__(self, camera: RealSenseCamera) -> None:
+        """
+        Инициализация детектора касаний
         
-    def initialize(self) -> bool:
-        """Инициализация системы"""
-        print("=== Система отслеживания ног RealSense D435f ===")
-        print("Инициализация...")
+        Args:
+            camera: Экземпляр камеры RealSense
+        """
+        self.camera: RealSenseCamera = camera
+        self.logger: logging.Logger = logging.getLogger(__name__)
+        self.window_name: str = 'RealSense D435F - Touch Detection'
         
+        # Калибратор проекции
+        self.calibrator: Optional[ProjectionCalibrator] = None
+        self.is_calibration_mode: bool = False
+        
+        # Обрезчик проекции
+        self.cropper: ProjectionAreaCropper = ProjectionAreaCropper(output_size=(800,600))
+        self.show_cropped: bool = False  # Режим отображения: False - исходные, True - обрезанные
+        self.show_projection_area: bool = True  # Показывать ли область проекции на исходном изображении
+        
+        # Процессор касаний
+        self.touch_processor: Optional[TouchProcessor] = None
+        self.touch_detection_enabled: bool = False  # Включена ли детекция касаний
+        self.show_touches: bool = True  # Показывать ли касания на изображении
+        self.current_touches: List = []  # Текущие обнаруженные касания
+        self.show_debug_images: bool = False  # Показывать ли отладочные изображения детекции
+        
+        # Unity коммуникация
+        self.unity_comm: Optional[UnityCommunication] = None
+        self.unity_enabled: bool = True  # Включена ли отправка в Unity
+        self.unity_host: str = "127.0.0.1"  # IP адрес Unity
+        self.unity_port: int = 8052  # UDP порт для Unity
+        
+        # Калибровка поверхности
+        self.surface_calibration_mode: bool = False  # Режим калибровки поверхности
+        self.surface_calibration_points_needed: int = 5  # Количество точек для калибровки
+        
+        # Инициализация камеры
+        self._setup_logging()
+        
+        # Инициализируем процессор касаний если есть калибровка
+        self._init_touch_processor()
+        
+        # Настройка обработчика мыши
+        self._setup_mouse_callback()
+        
+        # Создание окна управления с ползунками
+        self._setup_control_window()
+    
+    def _setup_logging(self) -> None:
+        """
+        Настройка логирования
+        """
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+    
+    def _init_touch_processor(self) -> None:
+        """
+        Инициализация процессора касаний
+        """
+        if self.cropper.is_calibrated:
+            self.touch_processor = TouchProcessor(
+                cropped_width=800,
+                cropped_height=600,
+                target_width=1920,
+                target_height=1080
+            )
+            self.logger.info("TouchProcessor инициализирован")
+            
+            # Инициализируем Unity коммуникацию
+            self._init_unity_communication()
+        else:
+            self.logger.info("TouchProcessor не инициализирован - нет калибровки")
+    
+    def _init_unity_communication(self) -> None:
+        """
+        Инициализация Unity коммуникации
+        """
         try:
-            # Проверяем доступность библиотек
-            print("Проверка библиотек...")
-            import numpy as np
-            import cv2
-            import pyrealsense2 as rs
-            print("✅ Все библиотеки доступны")
+            self.unity_comm = UnityCommunication(
+                host=self.unity_host,
+                port=self.unity_port,
+                target_width=1920,
+                target_height=1080
+            )
             
-            print("Инициализация трекера...")
-            self.tracker = FootTracker()
-            if not self.tracker.initialize():
-                print("❌ Не удалось инициализировать трекер")
-                return False
+            # Тестируем соединение
+            if self.unity_comm.test_connection():
+                self.logger.info(f"Unity коммуникация инициализирована: {self.unity_host}:{self.unity_port}")
+            else:
+                self.logger.warning("Unity приложение не отвечает, но модуль готов к работе")
                 
-            print("Инициализация визуализатора...")
-            self.visualizer = VisualizationManager()
-            print("✅ Система готова к работе!")
-            return True
-            
-        except ImportError as e:
-            print(f"❌ Ошибка импорта библиотеки: {e}")
-            print("Установите зависимости: pip install -r requirements.txt")
-            return False
         except Exception as e:
-            print(f"❌ Ошибка инициализации: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.error(f"Ошибка инициализации Unity коммуникации: {e}")
+            self.unity_comm = None
+    
+    def _setup_mouse_callback(self) -> None:
+        """
+        Настройка обработчика мыши для калибровки поверхности
+        """
+        cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(self.window_name, self.mouse_callback)
+    
+    def _setup_control_window(self) -> None:
+        """
+        Создание окна управления с ползунками для настройки параметров детекции
+        """
+        self.control_window_name = "Управление детекцией"
+        cv2.namedWindow(self.control_window_name, cv2.WINDOW_AUTOSIZE)
+        
+        # Создаем информационное изображение для окна управления
+        control_image = np.zeros((450, 500, 3), dtype=np.uint8)
+        cv2.putText(control_image, "Touch Detection Settings", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        if self.touch_processor is not None:
+            # Ползунок для background_threshold (-1 до 3 метров)
+            # OpenCV ползунки работают только с целыми числами, поэтому используем миллиметры
+            current_bg_threshold = int(self.touch_processor.get_background_threshold() * 1000)  # Конвертируем в мм
+            cv2.createTrackbar(
+                "background threshold (mm)",
+                self.control_window_name,
+                current_bg_threshold + 1000,  # Смещаем на 1000, чтобы -1000мм стало 0
+                4000,  # Диапазон: от 0 (=-1000мм) до 4000 (=3000мм)
+                self._on_background_threshold_change
+            )
+            
+            # Ползунок для touch_threshold (0 до 0.5 метров = 0 до 500 мм)
+            current_touch_threshold = int(self.touch_processor.get_touch_threshold() * 1000)
+            cv2.createTrackbar(
+                "touch threshold (mm)",
+                self.control_window_name,
+                current_touch_threshold,
+                500,  # 0 до 500мм
+                self._on_touch_threshold_change
+            )
+            
+            # Ползунок для смещения глубины (-100 до +200 мм)
+            current_depth_offset = int(self.touch_processor.get_depth_offset())
+            cv2.createTrackbar(
+                "depth offset (mm)",
+                self.control_window_name,
+                current_depth_offset + 100,  # Смещаем на 100, чтобы -100мм стало 0
+                300,  # Диапазон: от 0 (=-100мм) до 300 (=200мм)
+                self._on_depth_offset_change
+            )
+            
+            # Ползунок для масштабирования глубины (0.8 до 1.5)
+            current_scale_factor = int(self.touch_processor.get_depth_scale_factor() * 100)
+            cv2.createTrackbar(
+                "depth scale (%)",
+                self.control_window_name,
+                current_scale_factor,  # 80 до 150 (представляет 0.8 до 1.5)
+                150,
+                self._on_depth_scale_change
+            )
+            
+            # Ползунок для размера ядра пространственной фильтрации (3 до 15)
+            current_filter_kernel = self.touch_processor.get_spatial_filter_kernel()
+            cv2.createTrackbar(
+                "filter kernel",
+                self.control_window_name,
+                current_filter_kernel,
+                15,  # 3 до 15
+                self._on_spatial_filter_kernel_change
+            )
+            
+            # Ползунок для включения/выключения пространственной фильтрации
+            filter_enabled = 1 if self.touch_processor.get_spatial_filter_enabled() else 0
+            cv2.createTrackbar(
+                "filter on/off",
+                self.control_window_name,
+                filter_enabled,
+                1,  # 0 или 1
+                self._on_spatial_filter_toggle
+            )
+            
+            # Ползунок для включения/выключения Unity передачи
+            unity_enabled = 1 if self.unity_enabled else 0
+            cv2.createTrackbar(
+                "Unity send",
+                self.control_window_name,
+                unity_enabled,
+                1,  # 0 или 1
+                self._on_unity_enabled_toggle
+            )
+            
+            # Ползунок для Unity порта (8000-9000)
+            cv2.createTrackbar(
+                "Unity port",
+                self.control_window_name,
+                self.unity_port - 8000,  # Смещаем базу на 8000
+                1000,  # 8000 до 9000
+                self._on_unity_port_change
+            )
+            
+            # Добавляем информацию о текущих значениях
+            y_pos = 70
+            line_height = 25
+            
+            # Основные пороги
+            cv2.putText(control_image, f"Background Threshold: {self.touch_processor.get_background_threshold():.3f}m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            y_pos += line_height
+            
+            cv2.putText(control_image, f"Touch Threshold: {self.touch_processor.get_touch_threshold():.3f}m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            y_pos += line_height
+            
+            # Коррекция глубины
+            cv2.putText(control_image, f"Depth Offset: {self.touch_processor.get_depth_offset():.1f}mm", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+            y_pos += line_height
+            
+            cv2.putText(control_image, f"Depth Scale: {self.touch_processor.get_depth_scale_factor():.2f}x", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+            y_pos += line_height
+            
+            # Фильтрация
+            filter_status = "ON" if self.touch_processor.get_spatial_filter_enabled() else "OFF"
+            cv2.putText(control_image, f"Spatial Filter: {filter_status} (kernel: {self.touch_processor.get_spatial_filter_kernel()})", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            y_pos += line_height
+            
+            # Разделительная линия
+            cv2.line(control_image, (10, y_pos + 5), (440, y_pos + 5), (100, 100, 100), 1)
+            y_pos += 20
+            
+            # Диапазоны значений
+            cv2.putText(control_image, "Ranges:", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            y_pos += line_height
+            
+            cv2.putText(control_image, "Background: -1.0m ... +3.0m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, "Touch: 0.0m ... 0.5m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, "Depth Offset: -100mm ... +200mm", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, "Depth Scale: 0.8x ... 1.5x", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            
+            self.logger.info("Окно управления создано")
+        else:
+            cv2.putText(control_image, "TouchProcessor не инициализирован", (10, 70), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(control_image, "Сначала выполните калибровку", (10, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            self.logger.warning("TouchProcessor не инициализирован - окно управления не создано")
+        
+        # Отображаем информационное изображение
+        cv2.imshow(self.control_window_name, control_image)
+    
+    def _on_background_threshold_change(self, value: int) -> None:
+        """
+        Callback для изменения порога фона
+        
+        Args:
+            value: Значение от 0 до 4000 (представляет от -1000мм до +3000мм)
+        """
+        if self.touch_processor is not None:
+            # Конвертируем обратно в метры: 0->-1.0м, 1000->0.0м, 4000->3.0м
+            threshold_meters = (value - 1000) / 1000.0
+            self.touch_processor.set_background_threshold(threshold_meters)
+            self.logger.debug(f"Порог фона изменен: {threshold_meters:.3f}м")
+            self._update_control_window()
+    
+    def _on_touch_threshold_change(self, value: int) -> None:
+        """
+        Callback для изменения порога касания
+        
+        Args:
+            value: Значение от 0 до 500 (представляет от 0мм до 500мм)
+        """
+        if self.touch_processor is not None:
+            # Конвертируем в метры
+            threshold_meters = value / 1000.0
+            self.touch_processor.set_touch_threshold(threshold_meters)
+            self.logger.debug(f"Порог касания изменен: {threshold_meters:.3f}м")
+            self._update_control_window()
+    
+    def _on_depth_offset_change(self, value: int) -> None:
+        """
+        Callback для изменения смещения глубины
+        
+        Args:
+            value: Значение от 0 до 300 (представляет от -100мм до +200мм)
+        """
+        if self.touch_processor is not None:
+            # Конвертируем обратно в мм: 0->-100мм, 100->0мм, 300->200мм
+            offset_mm = value - 100
+            self.touch_processor.set_depth_offset(offset_mm)
+            self.logger.debug(f"Смещение глубины изменено: {offset_mm:.1f}мм")
+            self._update_control_window()
+    
+    def _on_depth_scale_change(self, value: int) -> None:
+        """
+        Callback для изменения масштабирования глубины
+        
+        Args:
+            value: Значение от 80 до 150 (представляет от 0.8 до 1.5)
+        """
+        if self.touch_processor is not None:
+            # Конвертируем в коэффициент: 80->0.8, 100->1.0, 150->1.5
+            scale_factor = max(80, min(150, value)) / 100.0
+            self.touch_processor.set_depth_scale_factor(scale_factor)
+            self.logger.debug(f"Коэффициент масштабирования изменен: {scale_factor:.2f}")
+            self._update_control_window()
+    
+    def _on_spatial_filter_kernel_change(self, value: int) -> None:
+        """
+        Callback для изменения размера ядра пространственной фильтрации
+        
+        Args:
+            value: Размер ядра от 3 до 15
+        """
+        if self.touch_processor is not None:
+            kernel_size = max(3, min(15, value))
+            # Убеждаемся, что размер нечетный
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            self.touch_processor.set_spatial_filter_kernel(kernel_size)
+            self.logger.debug(f"Размер ядра фильтра изменен: {kernel_size}")
+            self._update_control_window()
+    
+    def _on_spatial_filter_toggle(self, value: int) -> None:
+        """
+        Callback для включения/выключения пространственной фильтрации
+        
+        Args:
+            value: 0 - выключено, 1 - включено
+        """
+        if self.touch_processor is not None:
+            enabled = bool(value)
+            self.touch_processor.set_spatial_filter_enabled(enabled)
+            status = "включена" if enabled else "выключена"
+            self.logger.debug(f"Пространственная фильтрация {status}")
+            self._update_control_window()
+    
+    def _on_unity_enabled_toggle(self, value: int) -> None:
+        """
+        Callback для включения/выключения Unity передачи
+        
+        Args:
+            value: 0 - выключено, 1 - включено
+        """
+        self.unity_enabled = bool(value)
+        status = "включена" if self.unity_enabled else "выключена"
+        self.logger.info(f"Unity передача {status}")
+        
+        if self.unity_comm:
+            self.unity_comm.set_enabled(self.unity_enabled)
+        
+        self._update_control_window()
+    
+    def _on_unity_port_change(self, value: int) -> None:
+        """
+        Callback для изменения Unity порта
+        
+        Args:
+            value: Значение от 0 до 1000 (представляет порты от 8000 до 9000)
+        """
+        new_port = 8000 + value
+        if new_port != self.unity_port:
+            self.unity_port = new_port
+            self.logger.info(f"Unity порт изменен на: {self.unity_port}")
+            
+            # Переинициализируем Unity коммуникацию с новым портом
+            if self.unity_comm:
+                self.unity_comm.set_server_address(self.unity_host, self.unity_port)
+            
+            self._update_control_window()
+    
+    def _update_control_window(self) -> None:
+        """
+        Обновление информации в окне управления
+        """
+        if hasattr(self, 'control_window_name') and self.touch_processor is not None:
+            # Создаем обновленное информационное изображение
+            control_image = np.zeros((450, 500, 3), dtype=np.uint8)
+            cv2.putText(control_image, "Touch Detection Settings", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            
+            # Добавляем информацию о текущих значениях
+            y_pos = 70
+            line_height = 25
+            
+            # Основные пороги
+            cv2.putText(control_image, f"Background Threshold: {self.touch_processor.get_background_threshold():.3f}m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            y_pos += line_height
+            
+            cv2.putText(control_image, f"Touch Threshold: {self.touch_processor.get_touch_threshold():.3f}m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            y_pos += line_height
+            
+            # Коррекция глубины
+            cv2.putText(control_image, f"Depth Offset: {self.touch_processor.get_depth_offset():.1f}mm", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+            y_pos += line_height
+            
+            cv2.putText(control_image, f"Depth Scale: {self.touch_processor.get_depth_scale_factor():.2f}x", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+            y_pos += line_height
+            
+            # Фильтрация
+            filter_status = "ON" if self.touch_processor.get_spatial_filter_enabled() else "OFF"
+            cv2.putText(control_image, f"Spatial Filter: {filter_status} (kernel: {self.touch_processor.get_spatial_filter_kernel()})", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+            y_pos += line_height
+            
+            # Разделительная линия
+            cv2.line(control_image, (10, y_pos + 5), (440, y_pos + 5), (100, 100, 100), 1)
+            y_pos += 20
+            
+            # Диапазоны значений
+            cv2.putText(control_image, "Ranges:", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            y_pos += line_height
+            
+            cv2.putText(control_image, "Background: -1.0m ... +3.0m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, "Touch: 0.0m ... 0.5m", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, "Depth Offset: -100mm ... +200mm", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, "Depth Scale: 0.8x ... 1.5x", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, "Press 'ESC' to exit", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            
+            # Отображаем обновленное изображение
+            cv2.imshow(self.control_window_name, control_image)
+    
+    def mouse_callback(self, event: int, x: int, y: int, flags: int, param: Any) -> None:
+        """
+        Обработчик событий мыши для калибровки поверхности
+        
+        Args:
+            event: Тип события мыши
+            x: X координата курсора
+            y: Y координата курсора
+            flags: Дополнительные флаги
+            param: Дополнительные параметры
+        """
+        if (event == cv2.EVENT_LBUTTONDOWN and self.surface_calibration_mode and 
+            self.touch_processor is not None and self.show_cropped):
+            
+            # Проверяем, что клик в области обрезанного изображения (левая часть)
+            if x < 800:  # Ширина обрезанного изображения
+                # Получаем текущие обрезанные изображения
+                # Нужно получить их из последнего кадра
+                if hasattr(self, '_last_cropped_depth') and self._last_cropped_depth is not None:
+                    success = self.touch_processor.add_surface_calibration_point(x, y, self._last_cropped_depth)
+                    if success:
+                        points_collected = len(self.touch_processor.surface_calibration_points)
+                        self.logger.info(f"Точек калибровки собрано: {points_collected}/{self.surface_calibration_points_needed}")
+                        
+                        # Автоматическая калибровка после сбора достаточного количества точек
+                        if points_collected >= self.surface_calibration_points_needed:
+                            if self.touch_processor.calibrate_surface_height():
+                                self.surface_calibration_mode = False
+                                self.logger.info("Калибровка поверхности завершена автоматически")
+                            else:
+                                self.logger.warning("Не удалось завершить калибровку поверхности")
+                else:
+                    self.logger.warning("Нет данных о глубине для калибровки")
+    
+    def test_camera_connection(self) -> bool:
+        """
+        Тест подключения камеры RealSense
+        
+        Returns:
+            True если камера доступна, False в противном случае
+        """
+        try:
+            test_camera: RealSenseCamera = RealSenseCamera()
+            if test_camera.start():
+                self.logger.info("Тест подключения камеры прошел успешно")
+                test_camera.stop()
+                return True
+            else:
+                self.logger.error("Не удалось подключиться к камере")
+                return False
+        except Exception as e:
+            self.logger.error(f"Ошибка при тестировании камеры: {e}")
             return False
     
-    def run_tracking(self) -> None:
-        """Запуск основного режима отслеживания"""
-        print("\nЗапуск отслеживания ног...")
-        self._print_controls()
+    def _create_display_image(self, color_image: np.ndarray, depth_image: np.ndarray) -> np.ndarray:
+        """
+        Создание комбинированного изображения для отображения
         
-        cv2.namedWindow('Camera View')
-        cv2.namedWindow('Screen Space') 
-        cv2.namedWindow('Floor Mask')
-        
-        self.running = True
-        
-        try:
-            while self.running:
-                try:
-                    # Получение данных от трекера
-                    debug_image, mask_image, foot_positions = self.tracker.process_frame()
+        Args:
+            color_image: Цветное изображение
+            depth_image: Изображение глубины
+            
+        Returns:
+            Комбинированное изображение
+        """
+        if self.show_cropped and self.cropper.is_calibrated:
+            # Режим отображения обрезанных изображений
+            cropped_color, cropped_depth = self.cropper.crop_both_images(color_image, depth_image)
+            
+            if cropped_color is not None and cropped_depth is not None:
+                # Применяем цветовую карту к обрезанному изображению глубины
+                depth_colormap: np.ndarray = self.camera.apply_colormap_to_depth(cropped_depth)
+                
+                # Создаем комбинированное изображение
+                images: np.ndarray = np.hstack((cropped_color, depth_colormap))
+                
+                # Добавляем текст с информацией
+                cv2.putText(
+                    images,
+                    'Cropped Color',
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2
+                )
+                
+                cv2.putText(
+                    images,
+                    'Cropped Depth',
+                    (cropped_color.shape[1] + 10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2
+                )
+                
+                # Добавляем информацию о размере
+                cv2.putText(
+                    images,
+                    f'Size: {cropped_color.shape[1]}x{cropped_color.shape[0]}',
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    1
+                )
+                
+                # Сохраняем последние обрезанные изображения для калибровки поверхности
+                self._last_cropped_depth = cropped_depth
+                
+                # Обрабатываем касания если включена детекция
+                if self.touch_detection_enabled and self.touch_processor is not None:
+                    self.current_touches = self.touch_processor.process_frame(cropped_color, cropped_depth)
                     
-                    if debug_image is None:
-                        continue
+                    # Отправляем касания в Unity если включена передача
+                    if self.unity_enabled and self.unity_comm is not None and self.current_touches:
+                        self.unity_comm.send_touch_coordinates(self.current_touches)
                     
-                    # Создание визуализаций
-                    camera_view = self.visualizer.create_camera_view(
-                        debug_image, mask_image, [], foot_positions,
-                        calibration_points=self.tracker.calibration.calibration_points,
-                        is_calibrated=self.tracker.calibration.is_calibrated
+                    # Добавляем отладочные изображения если включен режим отладки
+                    if self.show_debug_images:
+                        debug_images = self.touch_processor.get_debug_images()
+                        debug_list = []
+                        
+                        # Добавляем бинарное изображение зоны детекции
+                        if debug_images['binary'] is not None:
+                            binary_colored = cv2.applyColorMap(debug_images['binary'], cv2.COLORMAP_HOT)
+                            # Добавляем подпись
+                            cv2.putText(
+                                binary_colored,
+                                'Binary Detection',
+                                (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7,
+                                (255, 255, 255),
+                                2
+                            )
+                            debug_list.append(binary_colored)
+                        
+                        # Добавляем нормализованное разностное изображение
+                        if debug_images['depth_diff_normalized'] is not None:
+                            diff_colored = cv2.applyColorMap(debug_images['depth_diff_normalized'], cv2.COLORMAP_VIRIDIS)
+                            # Добавляем подпись
+                            cv2.putText(
+                                diff_colored,
+                                'Depth Difference',
+                                (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7,
+                                (255, 255, 255),
+                                2
+                            )
+                            debug_list.append(diff_colored)
+                        
+                        # Объединяем с основными изображениями
+                        if debug_list:
+                            images = np.hstack([images] + debug_list)
+                    
+                    # Визуализируем касания на обрезанном изображении
+                    if self.show_touches and self.current_touches:
+                        images = self._visualize_touches_on_cropped(images, cropped_color)
+                
+                # Визуализация режима калибровки поверхности
+                if self.surface_calibration_mode and self.touch_processor is not None:
+                    images = self._visualize_surface_calibration(images)
+                
+                # Добавляем информацию о касаниях и режиме отладки
+                touch_status = "ON" if self.touch_detection_enabled else "OFF"
+                cv2.putText(
+                    images,
+                    f'Touch Detection: {touch_status}',
+                    (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0) if self.touch_detection_enabled else (0, 0, 255),
+                    1
+                )
+                
+                # Информация о режиме отладки
+                debug_status = "ON" if self.show_debug_images else "OFF"
+                cv2.putText(
+                    images,
+                    f'Debug Mode: {debug_status}',
+                    (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 0) if self.show_debug_images else (128, 128, 128),
+                    1
+                )
+                
+                if self.current_touches:
+                    cv2.putText(
+                        images,
+                        f'Touches: {len(self.current_touches)}',
+                        (10, 130),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 0),
+                        1
                     )
-                    screen_view = self.visualizer.create_screen_view(foot_positions)
+                
+                # Добавляем информацию о чувствительности
+                if self.touch_processor is not None:
+                    sensitivity_text = f'Sensitivity: {self.touch_processor.sensitivity_level}/10'
+                    cv2.putText(
+                        images,
+                        sensitivity_text,
+                        (10, 130),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 255),
+                        1
+                    )
                     
-                    # Отображение (с проверкой существования изображений)
-                    if camera_view is not None:
-                        cv2.imshow('Camera View', camera_view)
-                    if screen_view is not None:
-                        cv2.imshow('Screen Space', screen_view)
-                    if mask_image is not None:
-                        cv2.imshow('Floor Mask', mask_image)
-                    
-                    # Вывод координат в консоль
-                    if foot_positions:
-                        positions_str = ", ".join([
-                            f"Стопа-{foot.id}:cam({foot.camera_x},{foot.camera_y})->screen({foot.screen_x},{foot.screen_y})"
-                            for foot in foot_positions
-                        ])
-                        print(f"\rСтоп: {len(foot_positions)} | {positions_str}", end="")
-                        
-                        # Дополнительная отладка для первой стопы
-                        if len(foot_positions) > 0:
-                            first_foot = foot_positions[0]
-                            if self.tracker.calibration.is_calibrated:
-                                print(f"\n🔍 ОТЛАДКА стопы {first_foot.id}:")
-                                print(f"   Камера: ({first_foot.camera_x}, {first_foot.camera_y})")
-                                print(f"   Экран:  ({first_foot.screen_x}, {first_foot.screen_y})")
-                                
-                                # Проверим преобразование заново с отладкой
-                                debug_x, debug_y = self.tracker.calibration.transform_point(
-                                    first_foot.camera_x, first_foot.camera_y, debug=True
-                                )
-                    
-                    # Обработка клавиш
-                    if not self._handle_keys():
-                        break
-                        
-                except Exception as frame_error:
-                    print(f"\nОшибка обработки кадра: {frame_error}")
-                    # Продолжаем работу, не выходим из-за одной ошибки
-                    continue
-                    
-        except KeyboardInterrupt:
-            print("\nОстановка программы...")
-        finally:
-            self.running = False
-            cv2.destroyAllWindows()
+                    # Информация о калибровке поверхности
+                    surface_status = "Calibrated" if self.touch_processor.surface_height is not None else "Not Calibrated"
+                    surface_color = (0, 255, 0) if self.touch_processor.surface_height is not None else (0, 0, 255)
+                    cv2.putText(
+                        images,
+                        f'Surface: {surface_status}',
+                        (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        surface_color,
+                        1
+                    )
+            else:
+                # Если обрезка не удалась, показываем исходные изображения
+                return self._create_original_display_image(color_image, depth_image)
+        else:
+            # Режим отображения исходных изображений
+            images = self._create_original_display_image(color_image, depth_image)
+        
+        # Добавляем инструкции по управлению
+        if self.surface_calibration_mode:
+            instructions = [
+                "SURFACE CALIBRATION MODE - Click on surface points",
+                f"Points collected: {len(self.touch_processor.surface_calibration_points) if self.touch_processor else 0}/{self.surface_calibration_points_needed}",
+                "ESC - exit surface calibration",
+                "Q - exit program"
+            ]
+        else:
+            instructions = [
+                "C - enter calibration mode",
+                "V - toggle cropped/original view",
+                "P - toggle projection area overlay", 
+                "T - toggle touch detection",
+                "S - enter surface calibration mode",
+                "D - toggle debug images (binary detection)",
+                "+ / - - adjust touch sensitivity",
+                "B - set background (when touch detection on)",
+                "R - reset touch background",
+                "Q - exit program"
+            ]
+        
+        y_offset = images.shape[0]//2 - 100
+        for instruction in instructions:
+            cv2.putText(
+                images,
+                instruction,
+                (8, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),  # Черная обводка
+                3,  # Толщина обводки
+                cv2.LINE_AA
+            )
+            cv2.putText(
+                images,
+                instruction,
+                (8, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1
+            )
+            y_offset += 20
+        
+        return images
     
-    def run_calibration(self) -> None:
-        """Запуск режима калибровки проекции"""
-        print("\n=== КАЛИБРОВКА ПРОЕКЦИИ ===")
-        print("Кликните мышью по 4 углам проекционной области")
-        print("ESC - выход, R - сброс, S - сохранить")
+    def _create_original_display_image(self, color_image: np.ndarray, depth_image: np.ndarray) -> np.ndarray:
+        """
+        Создание комбинированного изображения с исходными кадрами
         
-        calibrator = InteractiveCalibrator(self.tracker.calibration)
-        cv2.namedWindow('Calibration')
-        cv2.setMouseCallback('Calibration', calibrator.mouse_callback)
+        Args:
+            color_image: Цветное изображение
+            depth_image: Изображение глубины
+            
+        Returns:
+            Комбинированное изображение
+        """
+        # Показываем область проекции если нужно и есть калибровка
+        if self.show_projection_area and self.cropper.is_calibrated:
+            color_with_overlay = self.cropper.visualize_crop_area(color_image)
+        else:
+            color_with_overlay = color_image.copy()
         
-        self.running = True
+        # Применяем цветовую карту к изображению глубины для визуализации
+        depth_colormap: np.ndarray = self.camera.apply_colormap_to_depth(depth_image)
         
+        # Создаем комбинированное изображение для отображения
+        images: np.ndarray = np.hstack((color_with_overlay, depth_colormap))
+        
+        # Добавляем текст с информацией
+        cv2.putText(
+            images,
+            'Original Color',
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+        
+        cv2.putText(
+            images,
+            'Original Depth',
+            (color_image.shape[1] + 10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+        
+        # Добавляем статус калибровки
+        calibration_status = "Calibrated" if self.cropper.is_calibrated else "Not Calibrated"
+        cv2.putText(
+            images,
+            f'Status: {calibration_status}',
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0) if self.cropper.is_calibrated else (0, 0, 255),
+            1
+        )
+        
+        return images
+    
+    def _visualize_touches_on_cropped(self, combined_image: np.ndarray, cropped_color: np.ndarray) -> np.ndarray:
+        """
+        Визуализация касаний на комбинированном изображении с обрезанными кадрами
+        
+        Args:
+            combined_image: Комбинированное изображение (color + depth)
+            cropped_color: Обрезанное цветное изображение
+            
+        Returns:
+            Изображение с визуализированными касаниями
+        """
+        result = combined_image.copy()
+        
+        for i, (scaled_x, scaled_y, touch_info) in enumerate(self.current_touches):
+            # Получаем исходные координаты в кропнутом изображении
+            orig_x = touch_info["original_x"]
+            orig_y = touch_info["original_y"]
+            confidence = touch_info["confidence"]
+            area = touch_info["area"]
+            
+            # Цвет зависит от уверенности
+            color = (0, int(255 * confidence), int(255 * (1 - confidence)))
+            
+            # Рисуем круг в точке касания на левой (цветной) части
+            cv2.circle(result, (orig_x, orig_y), 10, color, -1)
+            cv2.circle(result, (orig_x, orig_y), 15, color, 2)
+            
+            # Добавляем номер касания
+            cv2.putText(
+                result,
+                str(i + 1),
+                (orig_x + 20, orig_y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2
+            )
+            
+            # Добавляем информацию о касании - координаты в целевом разрешении
+            info_text = f"({scaled_x},{scaled_y})"
+            cv2.putText(
+                result,
+                info_text,
+                (orig_x + 20, orig_y + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                color,
+                1
+            )
+            
+            # Показываем также на depth части (правая часть изображения)
+            depth_x = orig_x + cropped_color.shape[1]
+            cv2.circle(result, (depth_x, orig_y), 8, color, 2)
+            
+            # Выводим информацию о касании в консоль
+            self.logger.info(f"Touch {i+1}: screen({scaled_x},{scaled_y}) crop({orig_x},{orig_y}) conf={confidence:.2f}")
+        
+        return result
+    
+    def _visualize_surface_calibration(self, combined_image: np.ndarray) -> np.ndarray:
+        """
+        Визуализация режима калибровки поверхности
+        
+        Args:
+            combined_image: Комбинированное изображение
+            
+        Returns:
+            Изображение с визуализацией калибровки поверхности
+        """
+        result = combined_image.copy()
+        
+        if self.touch_processor is not None:
+            # Отображаем уже собранные точки калибровки
+            for i, (x, y, depth) in enumerate(self.touch_processor.surface_calibration_points):
+                cv2.circle(result, (x, y), 8, (255, 0, 255), -1)  # Фиолетовые точки
+                cv2.circle(result, (x, y), 12, (255, 0, 255), 2)
+                
+                # Номер точки
+                cv2.putText(
+                    result,
+                    str(i + 1),
+                    (x + 15, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 0, 255),
+                    2
+                )
+            
+            # Добавляем информацию о режиме калибровки
+            cv2.putText(
+                result,
+                "SURFACE CALIBRATION MODE",
+                (10, 130),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 0, 255),
+                2
+            )
+            
+            points_text = f"Points: {len(self.touch_processor.surface_calibration_points)}/{self.surface_calibration_points_needed}"
+            cv2.putText(
+                result,
+                points_text,
+                (10, 160),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 0, 255),
+                2
+            )
+        
+        return result
+    
+    def _enter_calibration_mode(self) -> None:
+        """
+        Вход в режим калибровки проекции
+        """
+        self.logger.info("Переход в режим калибровки проекции")
+        self.is_calibration_mode = True
+        
+        # Создаем калибратор
+        self.calibrator = ProjectionCalibrator(self.camera)
+        
+        # Закрываем основное окно
+        cv2.destroyWindow(self.window_name)
+        
+        # Запускаем калибровку
+        calibration_success = self.calibrator.calibrate()
+        
+        if calibration_success:
+            self.logger.info("Калибровка завершена успешно")
+            # Перезагружаем cropper с новыми данными калибровки
+            self.cropper = ProjectionAreaCropper(output_size=(800, 600))
+            if self.cropper.is_calibrated:
+                self.logger.info("Обрезчик проекции обновлен с новой калибровкой")
+                # Переинициализируем процессор касаний
+                self._init_touch_processor()
+            else:
+                self.logger.warning("Не удалось загрузить новые данные калибровки в обрезчик")
+        else:
+            self.logger.info("Калибровка была отменена")
+        
+        # Возвращаемся в основной режим
+        self._exit_calibration_mode()
+    
+    def _exit_calibration_mode(self) -> None:
+        """
+        Выход из режима калибровки
+        """
+        self.is_calibration_mode = False
+        self.calibrator = None
+        self.logger.info("Возврат в основной режим")
+    
+    def run(self) -> None:
+        """
+        Запуск основного цикла детекции касаний
+        """
         try:
-            while self.running:
-                try:
-                    depth_image, color_image = self.tracker.camera.get_frames()
-                    if color_image is None:
-                        continue
-                    
-                    overlay_image = calibrator.run_calibration(color_image)
-                    if overlay_image is not None:
-                        cv2.imshow('Calibration', overlay_image)
-                        
-                except Exception as cal_error:
-                    print(f"\nОшибка в калибровке: {cal_error}")
-                    continue
+            # Используем контекстный менеджер для автоматического управления ресурсами
+            with self.camera:
+                self.logger.info("Камера запущена. Нажмите 'q' для выхода")
                 
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:  # ESC
-                    break
-                elif key == ord('r') or key == ord('R'):
-                    self.tracker.calibration.reset_calibration()
-                elif key == ord('s') or key == ord('S'):
-                    self.tracker.calibration.save_calibration()
-                    
+                # Получаем масштаб глубины
+                depth_scale: float = self.camera.get_depth_scale()
+                self.logger.info(f"Масштаб глубины: {depth_scale:.6f}")
+                
+                # Получаем внутренние параметры камеры
+                color_intrinsics, depth_intrinsics = self.camera.get_intrinsics()
+                if color_intrinsics and depth_intrinsics:
+                    self.logger.info(f"Внутренние параметры цветной камеры: {color_intrinsics.width}x{color_intrinsics.height}")
+                    self.logger.info(f"Внутренние параметры камеры глубины: {depth_intrinsics.width}x{depth_intrinsics.height}")
+                
+                # Основной цикл обработки
+                self._main_loop()
+                
+        except RuntimeError as e:
+            self.logger.error(f"Ошибка инициализации камеры: {e}")
+            sys.exit(1)
         except KeyboardInterrupt:
-            print("\nОстановка калибровки...")
+            self.logger.info("Прерывание от пользователя")
+        except Exception as e:
+            self.logger.error(f"Неожиданная ошибка: {e}")
+            sys.exit(1)
         finally:
+            # Закрываем Unity коммуникацию
+            if self.unity_comm:
+                self.unity_comm.close()
+            
+            # Закрываем все окна OpenCV
             cv2.destroyAllWindows()
+            self.logger.info("Приложение завершено")
     
-    def _handle_keys(self) -> bool:
-        """Обработка нажатий клавиш"""
-        key = cv2.waitKey(1) & 0xFF
-        
-        if key == 27:  # ESC - выход
-            return False
-        elif key == ord('c') or key == ord('C'):  # Автокалибровка пола
-            self.tracker.calibrate_floor_depth()
-        elif key == ord('+') or key == ord('='):  # Увеличить глубину пола
-            new_depth = self.tracker.floor_detector.floor_depth + 0.05
-            self.tracker.set_floor_depth(new_depth)
-            print(f"\nГлубина пола: {new_depth:.2f}м")
-        elif key == ord('-'):  # Уменьшить глубину пола
-            new_depth = max(0.5, self.tracker.floor_detector.floor_depth - 0.05)
-            self.tracker.set_floor_depth(new_depth)
-            print(f"\nГлубина пола: {new_depth:.2f}м")
-        elif key == ord('s') or key == ord('S'):  # Сохранить настройки
-            self.tracker.calibration.save_calibration()
-            print("\nНастройки сохранены")
-        elif key == ord('t') or key == ord('T'):  # Переключить следы
-            self.visualizer.toggle_trails()
-        elif key == ord('g') or key == ord('G'):  # Переключить сетку
-            self.visualizer.toggle_grid()
-        elif key == ord('r') or key == ord('R'):  # Очистить следы
-            self.visualizer.clear_trails()
-        elif key == ord('d') or key == ord('D'):  # Отладочная информация
-            self._show_debug_info()
-        elif key == ord('x') or key == ord('X'):  # Сброс калибровки
-            if self.tracker and self.tracker.calibration:
-                self.tracker.calibration.reset_calibration()
-                print("\n✅ Калибровка сброшена! Нажмите ESC для перехода к новой калибровке.")
-        elif key == ord('m') or key == ord('M'):  # Тест преобразования координат
-            self._test_coordinate_mapping()
-        elif key == ord('f') or key == ord('F'):  # Принудительный пересчет калибровки
-            self._force_recalculate_calibration()
-        
-        return True
-    
-    def _show_debug_info(self) -> None:
-        """Показать отладочную информацию о калибровке"""
-        print("\n" + "="*50)
-        print("ОТЛАДОЧНАЯ ИНФОРМАЦИЯ")
-        print("="*50)
-        
-        if self.tracker and self.tracker.calibration:
-            cal = self.tracker.calibration
-            print(f"Статус калибровки: {'✅ Готова' if cal.is_calibrated else '❌ Не готова'}")
-            print(f"Разрешение камеры: {cal.camera_width}x{cal.camera_height}")
-            print(f"Целевое разрешение: {cal.target_width}x{cal.target_height}")
-            print(f"Точек калибровки: {len(cal.calibration_points)}/4")
-            
-            if cal.calibration_points:
-                print("Точки калибровки:")
-                for i, (x, y) in enumerate(cal.calibration_points):
-                    print(f"  {i+1}. ({x}, {y})")
-            
-            # Тест нескольких точек
-            if cal.is_calibrated:
-                print("\nТест преобразования координат:")
-                test_coords = [(100, 100), (320, 240), (540, 380)]
-                for cx, cy in test_coords:
-                    sx, sy = cal.transform_point(cx, cy, debug=True)
-                    
-        print("="*50)
-    
-    def _test_coordinate_mapping(self) -> None:
-        """Тестирование преобразования координат в различных точках"""
-        print("\n" + "="*60)
-        print("ТЕСТ ПРЕОБРАЗОВАНИЯ КООРДИНАТ")
-        print("="*60)
-        
-        if not self.tracker or not self.tracker.calibration.is_calibrated:
-            print("❌ Калибровка не готова!")
-            return
-        
-        cal = self.tracker.calibration
-        print(f"Разрешение камеры: {cal.camera_width}x{cal.camera_height}")
-        print(f"Целевое разрешение: {cal.target_width}x{cal.target_height}")
-        print(f"Точки калибровки: {len(cal.calibration_points)}")
-        
-        if len(cal.calibration_points) != 4:
-            print("❌ Недостаточно точек калибровки!")
-            return
-        
-        print("\nТестовые точки:")
-        
-        # Тест углов области калибровки
-        corners = cal.calibration_points
-        corner_names = ["TL", "TR", "BR", "BL"]
-        expected_corners = [
-            (0, 0), 
-            (cal.target_width-1, 0), 
-            (cal.target_width-1, cal.target_height-1), 
-            (0, cal.target_height-1)
-        ]
-        
-        for i, ((cx, cy), name, (exp_x, exp_y)) in enumerate(zip(corners, corner_names, expected_corners)):
-            act_x, act_y = cal.transform_point(cx, cy, debug=False)
-            error_x = abs(act_x - exp_x)
-            error_y = abs(act_y - exp_y)
-            status = "✅" if (error_x < 50 and error_y < 50) else "❌"
-            print(f"  {status} {name}: камера({cx},{cy}) -> ожидается({exp_x},{exp_y}) -> получили({act_x},{act_y}) [ошибка: {error_x},{error_y}]")
-        
-        # Тест центра области
-        center_x = sum(p[0] for p in corners) // 4
-        center_y = sum(p[1] for p in corners) // 4
-        center_screen_x, center_screen_y = cal.transform_point(center_x, center_y, debug=True)
-        expected_center_x = cal.target_width // 2
-        expected_center_y = cal.target_height // 2
-        
-        print(f"\n🎯 ЦЕНТР области:")
-        print(f"   Камера: ({center_x}, {center_y})")
-        print(f"   Ожидается: ({expected_center_x}, {expected_center_y})")
-        print(f"   Получили: ({center_screen_x}, {center_screen_y})")
-        
-        # Дополнительные тестовые точки
-        test_points = [
-            ("Четверть X, четверть Y", center_x//2, center_y//2),
-            ("Три четверти X, четверть Y", center_x + center_x//2, center_y//2),
-            ("Четверть X, три четверти Y", center_x//2, center_y + center_y//2),
-            ("Три четверти X, три четверти Y", center_x + center_x//2, center_y + center_y//2),
-        ]
-        
-        print(f"\n🧪 ДОПОЛНИТЕЛЬНЫЕ ТОЧКИ:")
-        for name, tx, ty in test_points:
-            screen_x, screen_y = cal.transform_point(tx, ty, debug=False)
-            print(f"   {name}: камера({tx},{ty}) -> экран({screen_x},{screen_y})")
-        
-        print("="*60)
-    
-    def _force_recalculate_calibration(self) -> None:
-        """Принудительный пересчет калибровки с улучшенным алгоритмом"""
-        print("\n" + "="*50)
-        print("ПРИНУДИТЕЛЬНЫЙ ПЕРЕСЧЕТ КАЛИБРОВКИ")
-        print("="*50)
-        
-        if not self.tracker or not self.tracker.calibration:
-            print("❌ Система не инициализирована!")
-            return
-        
-        cal = self.tracker.calibration
-        if len(cal.calibration_points) != 4:
-            print("❌ Недостаточно точек калибровки! Выполните калибровку сначала.")
-            return
-        
-        print("Текущие точки калибровки:")
-        for i, (x, y) in enumerate(cal.calibration_points):
-            print(f"  Точка {i+1}: ({x}, {y})")
-        
-        print("\n🔄 Пересчитываем гомографию с улучшенным алгоритмом...")
-        
-        # Сохраняем текущее состояние
-        old_calibrated = cal.is_calibrated
-        
-        # Принудительно запускаем пересчет
-        cal._calculate_homography()
-        
-        if cal.is_calibrated:
-            print("✅ Калибровка успешно пересчитана!")
-            
-            # Тестируем результат
-            center_x = sum(p[0] for p in cal.calibration_points) // 4
-            center_y = sum(p[1] for p in cal.calibration_points) // 4
-            screen_x, screen_y = cal.transform_point(center_x, center_y)
-            expected_x = cal.target_width // 2
-            expected_y = cal.target_height // 2
-            
-            print(f"🎯 Тест центра области:")
-            print(f"   Камера: ({center_x}, {center_y})")
-            print(f"   Экран:  ({screen_x}, {screen_y})")
-            print(f"   Ожидается: ({expected_x}, {expected_y})")
-            
-            error_x = abs(screen_x - expected_x)
-            error_y = abs(screen_y - expected_y)
-            if error_x < 100 and error_y < 100:
-                print("✅ Результат выглядит корректно!")
-            else:
-                print("⚠️ Большая ошибка! Возможно, нужна новая калибровка.")
-                
-        else:
-            print("❌ Ошибка пересчета калибровки!")
-        
-        print("="*50)
-    
-    def _quick_recalibrate(self) -> None:
-        """Быстрая рекалибровка - сброс и новая калибровка"""
-        print("\n=== БЫСТРАЯ РЕКАЛИБРОВКА ===")
-        
-        if self.tracker and self.tracker.calibration:
-            # Сброс текущей калибровки
-            self.tracker.calibration.reset_calibration()
-            print("✅ Текущая калибровка сброшена")
-            
-            print("\nТеперь выполним новую калибровку...")
-            print("ВАЖНО: Кликайте по углам в любом порядке - система автоматически определит правильный порядок!")
-            
-            # Переходим к калибровке
-            self.run_calibration()
-        else:
-            print("❌ Ошибка: система не инициализирована")
-    
-    def _print_controls(self) -> None:
-        """Вывод управления"""
-        print("\nУправление:")
-        print("  ESC - выход")
-        print("  C   - автокалибровка пола")
-        print("  +/- - изменить глубину пола")
-        print("  S   - сохранить настройки")
-        print("  T   - переключить следы")
-        print("  G   - переключить сетку")
-        print("  R   - очистить следы")
-        print("  D   - отладочная информация")
-        print("  M   - тест преобразования координат")
-        print("  F   - пересчитать калибровку (улучшенный алгоритм)")
-        print("  X   - сбросить калибровку проекции")
-    
-    def show_menu(self) -> None:
-        """Отображение меню"""
+    def _main_loop(self) -> None:
+        """
+        Основной цикл обработки кадров
+        """
         while True:
-            print("\n" + "="*50)
-            print("  СИСТЕМА ОТСЛЕЖИВАНИЯ НОГ REALSENSE D435F")
-            print("="*50)
-            print("1. Отслеживание ног (основной режим)")
-            print("2. Калибровка проекции")
-            print("3. Быстрая рекалибровка (сброс + новая калибровка)")
-            print("0. Выход")
-            print("-"*50)
+            # Если мы в режиме калибровки, пропускаем обработку основного цикла
+            if self.is_calibration_mode:
+                continue
             
-            choice = input("Выберите режим (0-3): ").strip()
+            # Получаем кадры с камеры
+            color_image, depth_image = self.camera.get_frames()
             
-            if choice == "1":
-                self.run_tracking()
-            elif choice == "2":
-                self.run_calibration()
-            elif choice == "3":
-                self._quick_recalibrate()
-            elif choice == "0":
+            if color_image is None or depth_image is None:
+                self.logger.warning("Не удалось получить кадры с камеры")
+                continue
+            
+            # Создаем изображение для отображения
+            display_image = self._create_display_image(color_image, depth_image)
+            
+            # Отображаем изображения
+            cv2.imshow(self.window_name, display_image)
+            
+            # Обработка нажатий клавиш
+            key: int = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
-            else:
-                print("Неверный выбор!")
-    
-    def cleanup(self) -> None:
-        """Очистка ресурсов"""
-        if self.tracker:
-            self.tracker.cleanup()
-        cv2.destroyAllWindows()
+            elif key == ord('c'):
+                # Переход в режим калибровки
+                self._enter_calibration_mode()
+            elif key == ord('v'):
+                # Переключение между исходным и обрезанным видом
+                if self.cropper.is_calibrated:
+                    self.show_cropped = not self.show_cropped
+                    mode = "cropped" if self.show_cropped else "original"
+                    self.logger.info(f"Переключен режим отображения: {mode}")
+                else:
+                    self.logger.warning("Сначала выполните калибровку для работы с обрезанными изображениями")
+            elif key == ord('p'):
+                # Переключение отображения области проекции
+                self.show_projection_area = not self.show_projection_area
+                status = "включено" if self.show_projection_area else "выключено"
+                self.logger.info(f"Отображение области проекции: {status}")
+            elif key == ord('t'):
+                # Переключение детекции касаний
+                if self.touch_processor is not None:
+                    self.touch_detection_enabled = not self.touch_detection_enabled
+                    status = "включена" if self.touch_detection_enabled else "выключена"
+                    self.logger.info(f"Детекция касаний: {status}")
+                    if not self.touch_detection_enabled:
+                        self.current_touches.clear()
+                else:
+                    self.logger.warning("TouchProcessor не инициализирован. Сначала выполните калибровку.")
+            elif key == ord('b'):
+                # Установка фонового изображения для детекции касаний
+                if self.touch_detection_enabled and self.touch_processor is not None and self.show_cropped:
+                    # Получаем текущие обрезанные изображения
+                    cropped_color, cropped_depth = self.cropper.crop_both_images(color_image, depth_image)
+                    if cropped_depth is not None:
+                        self.touch_processor.set_background(cropped_depth)
+                        self.logger.info("Фоновое изображение для детекции касаний установлено")
+                    else:
+                        self.logger.warning("Не удалось получить обрезанное изображение глубины")
+                else:
+                    self.logger.warning("Для установки фона включите детекцию касаний и режим обрезанного вида")
+            elif key == ord('r'):
+                # Сброс фонового изображения
+                if self.touch_processor is not None:
+                    self.touch_processor.reset_background()
+                    self.current_touches.clear()
+                    self.logger.info("Фоновое изображение сброшено")
+                else:
+                    self.logger.warning("TouchProcessor не инициализирован")
+            elif key == ord('d'):
+                # Переключение режима отладки
+                self.show_debug_images = not self.show_debug_images
+                status = "ВКЛЮЧЕН" if self.show_debug_images else "ВЫКЛЮЧЕН"
+                self.logger.info(f"Режим отладки {status}")
+                
+                if self.show_debug_images:
+                    self.logger.info("Показывать отладочные изображения: бинарная маска детекции и разность глубины")
+                    if not self.touch_detection_enabled:
+                        self.logger.warning("Для отображения отладочных изображений включите детекцию касаний (T)")
+                    if not self.show_cropped:
+                        self.logger.warning("Для отображения отладочных изображений переключитесь в режим кропнутого вида (V)")
+            elif key == ord('s'):
+                # Вход в режим калибровки поверхности
+                if self.touch_processor is not None and self.show_cropped:
+                    if not self.surface_calibration_mode:
+                        self.surface_calibration_mode = True
+                        self.touch_processor.clear_surface_calibration()
+                        self.logger.info("Начата калибровка поверхности. Кликните на 5 точек поверхности проекции.")
+                    else:
+                        # Завершаем калибровку вручную
+                        if len(self.touch_processor.surface_calibration_points) >= 3:
+                            if self.touch_processor.calibrate_surface_height():
+                                self.surface_calibration_mode = False
+                                self.logger.info("Калибровка поверхности завершена вручную")
+                            else:
+                                self.logger.warning("Не удалось завершить калибровку поверхности")
+                        else:
+                            self.logger.warning("Недостаточно точек для калибровки (минимум 3)")
+                else:
+                    self.logger.warning("Для калибровки поверхности включите обрезанный вид и инициализируйте TouchProcessor")
+            elif key == ord('+') or key == ord('='):
+                # Увеличение чувствительности
+                if self.touch_processor is not None:
+                    self.touch_processor.adjust_sensitivity(1)
+                else:
+                    self.logger.warning("TouchProcessor не инициализирован")
+            elif key == ord('-'):
+                # Уменьшение чувствительности
+                if self.touch_processor is not None:
+                    self.touch_processor.adjust_sensitivity(-1)
+                else:
+                    self.logger.warning("TouchProcessor не инициализирован")
+            elif key == 27:  # ESC
+                # Выход из режима калибровки поверхности
+                if self.surface_calibration_mode:
+                    self.surface_calibration_mode = False
+                    self.logger.info("Калибровка поверхности отменена")
 
 
 def main() -> None:
-    """Главная функция"""
-    parser = argparse.ArgumentParser(description="Система отслеживания ног RealSense")
-    parser.add_argument("--mode", choices=["tracking", "calibration"], 
-                       help="Прямой запуск режима")
+    """
+    Основная функция для запуска системы детекции касаний
+    """
+    # Создаем экземпляр камеры
+    camera: RealSenseCamera = RealSenseCamera(width=640, height=480, fps=15)
     
-    args = parser.parse_args()
+    # Создаем детектор касаний
+    touch_detector: TouchDetector = TouchDetector(camera)
     
-    try:
-        app = FootTrackingApp()
-        
-        if not app.initialize():
-            print("Ошибка инициализации. Проверьте подключение камеры.")
-            sys.exit(1)
-        
-        if args.mode == "tracking":
-            app.run_tracking()
-        elif args.mode == "calibration":
-            app.run_calibration()
-        else:
-            app.show_menu()
-            
-    except Exception as e:
-        print(f"Критическая ошибка: {e}")
-    finally:
-        if 'app' in locals():
-            app.cleanup()
+    # Сначала проверим подключение камеры
+    if touch_detector.test_camera_connection():
+        touch_detector.run()
+    else:
+        print("Не удалось подключиться к камере RealSense D435F")
+        print("Убедитесь что:")
+        print("1. Камера подключена к USB 3.0 порту")
+        print("2. Установлены драйверы Intel RealSense")
+        print("3. Установлена библиотека pyrealsense2")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
