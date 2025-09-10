@@ -8,6 +8,7 @@ import numpy as np
 import logging
 from typing import List, Tuple, Optional, Dict, Any
 import time
+from touch_filter import TouchFilter
 
 
 class TouchPoint:
@@ -92,6 +93,15 @@ class TouchProcessor:
         # История касаний для стабилизации
         self.touch_history: List[List[TouchPoint]] = []
         self.history_length: int = 3
+        
+        # Продвинутый фильтр касаний
+        self.touch_filter: TouchFilter = TouchFilter(
+            distance_threshold=30.0,
+            history_size=5,
+            min_movement_threshold=10.0,
+            timeout=2.0
+        )
+        self.use_advanced_filter: bool = True  # Включение/выключение продвинутой фильтрации
         
         # Статистика
         self.frame_count: int = 0
@@ -417,6 +427,46 @@ class TouchProcessor:
         
         return stable_touches
     
+    def _filter_touches(self, touches: List[TouchPoint]) -> List[TouchPoint]:
+        """
+        Фильтрация касаний с использованием продвинутого алгоритма
+        
+        Args:
+            touches: Список обнаруженных касаний
+            
+        Returns:
+            Отфильтрованный список касаний
+        """
+        if not self.use_advanced_filter or not touches:
+            return touches
+        
+        # Конвертируем TouchPoint в формат для TouchFilter
+        touch_data = []
+        for touch in touches:
+            touch_data.append((touch.x, touch.y, {
+                'depth': touch.depth,
+                'area': touch.area,
+                'confidence': touch.confidence,
+                'timestamp': touch.timestamp
+            }))
+        
+        # Применяем продвинутую фильтрацию
+        filtered_data = self.touch_filter.update(touch_data)
+        
+        # Конвертируем обратно в TouchPoint
+        filtered_touches = []
+        for x, y, info in filtered_data:
+            filtered_touch = TouchPoint(
+                x=int(x),
+                y=int(y),
+                depth=info['depth'],
+                area=info['area'],
+                confidence=info['confidence']
+            )
+            filtered_touches.append(filtered_touch)
+        
+        return filtered_touches
+    
     def process_frame(self, cropped_color: np.ndarray, cropped_depth: np.ndarray, 
                      auto_update_background: bool = True) -> List[Tuple[int, int, Dict[str, Any]]]:
         """
@@ -472,6 +522,10 @@ class TouchProcessor:
         
         # Стабилизация касаний
         stable_touches = self._stabilize_touches(current_touches)
+        
+        
+        
+        
         
         # Масштабирование координат и подготовка результата
         result = []
@@ -864,6 +918,100 @@ class TouchProcessor:
     def get_spatial_filter_kernel(self) -> int:
         """Возвращает размер ядра пространственной фильтрации"""
         return self.spatial_filter_kernel
+    
+    # Методы управления TouchFilter
+    def set_advanced_filter_enabled(self, enabled: bool) -> None:
+        """
+        Включает/выключает продвинутую фильтрацию касаний
+        
+        Args:
+            enabled: True для включения продвинутой фильтрации
+        """
+        self.use_advanced_filter = enabled
+        self.logger.debug(f"Продвинутая фильтрация касаний: {'включена' if enabled else 'выключена'}")
+    
+    def get_advanced_filter_enabled(self) -> bool:
+        """Возвращает состояние продвинутой фильтрации"""
+        return self.use_advanced_filter
+    
+    def set_filter_distance_threshold(self, threshold: float) -> None:
+        """
+        Устанавливает пороговое расстояние для фильтрации
+        
+        Args:
+            threshold: Пороговое расстояние в пикселях (5-100)
+        """
+        self.touch_filter.set_threshold(threshold)
+        self.logger.debug(f"Порог фильтрации касаний изменен на: {threshold}px")
+    
+    def get_filter_distance_threshold(self) -> float:
+        """Возвращает текущий порог фильтрации"""
+        return self.touch_filter.distance_threshold
+    
+    def set_filter_min_movement(self, min_movement: float) -> None:
+        """
+        Устанавливает минимальное движение для регистрации
+        
+        Args:
+            min_movement: Минимальное движение в пикселях (1-50)
+        """
+        self.touch_filter.set_min_movement(min_movement)
+        self.logger.debug(f"Минимальное движение изменено на: {min_movement}px")
+    
+    def get_filter_min_movement(self) -> float:
+        """Возвращает минимальное движение"""
+        return self.touch_filter.min_movement_threshold
+    
+    def set_filter_history_size(self, history_size: int) -> None:
+        """
+        Устанавливает размер истории фильтра
+        
+        Args:
+            history_size: Размер истории (2-20)
+        """
+        self.touch_filter.set_history_size(history_size)
+        self.logger.debug(f"Размер истории фильтра изменен на: {history_size}")
+    
+    def get_filter_history_size(self) -> int:
+        """Возвращает размер истории фильтра"""
+        return self.touch_filter.history_size
+    
+    def get_filter_statistics(self) -> Dict[str, Any]:
+        """
+        Получение статистики фильтра касаний
+        
+        Returns:
+            Словарь со статистикой фильтра
+        """
+        return self.touch_filter.get_statistics()
+    
+    def reset_filter(self) -> None:
+        """Сброс состояния фильтра касаний"""
+        self.touch_filter.reset()
+        self.logger.info("Состояние фильтра касаний сброшено")
+    
+    def set_filter_timeout(self, timeout: float) -> None:
+        """
+        Устанавливает таймаут для статичных касаний
+        
+        Args:
+            timeout: Время в секундах, после которого статичное касание скрывается (0.1-10.0)
+        """
+        self.touch_filter.set_timeout(timeout)
+        self.logger.debug(f"Таймаут касаний изменен на: {timeout}с")
+    
+    def get_filter_timeout(self) -> float:
+        """Возвращает текущий таймаут касаний"""
+        return self.touch_filter.get_timeout()
+    
+    def get_touch_durations(self) -> Dict[int, float]:
+        """
+        Получение длительности активных касаний
+        
+        Returns:
+            Словарь {touch_id: duration_in_seconds}
+        """
+        return self.touch_filter.get_touch_durations()
 
 
 def test_touch_processor() -> None:

@@ -133,7 +133,7 @@ class TouchDetector:
         cv2.namedWindow(self.control_window_name, cv2.WINDOW_AUTOSIZE)
         
         # Создаем информационное изображение для окна управления
-        control_image = np.zeros((450, 500, 3), dtype=np.uint8)
+        control_image = np.zeros((550, 500, 3), dtype=np.uint8)
         cv2.putText(control_image, "Touch Detection Settings", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         
@@ -216,6 +216,47 @@ class TouchDetector:
                 self.unity_port - 8000,  # Смещаем базу на 8000
                 1000,  # 8000 до 9000
                 self._on_unity_port_change
+            )
+            
+            # Ползунки для TouchFilter
+            # Включение/выключение продвинутой фильтрации
+            advanced_filter_enabled = 1 if self.touch_processor.get_advanced_filter_enabled() else 0
+            cv2.createTrackbar(
+                "advanced filter",
+                self.control_window_name,
+                advanced_filter_enabled,
+                1,  # 0 или 1
+                self._on_advanced_filter_toggle
+            )
+            
+            # Пороговое расстояние для фильтрации (5-100 пикселей)
+            current_filter_threshold = int(self.touch_processor.get_filter_distance_threshold())
+            cv2.createTrackbar(
+                "filter threshold",
+                self.control_window_name,
+                current_filter_threshold - 5,  # Смещаем базу на 5
+                95,  # 5 до 100
+                self._on_filter_threshold_change
+            )
+            
+            # Минимальное движение (1-50 пикселей)
+            current_min_movement = int(self.touch_processor.get_filter_min_movement())
+            cv2.createTrackbar(
+                "min movement",
+                self.control_window_name,
+                current_min_movement - 1,  # Смещаем базу на 1
+                49,  # 1 до 50
+                self._on_min_movement_change
+            )
+            
+            # Таймаут для статичных касаний (0.1-10.0 секунд)
+            current_timeout = int(self.touch_processor.get_filter_timeout() * 10)  # Конвертируем в десятые доли
+            cv2.createTrackbar(
+                "touch timeout",
+                self.control_window_name,
+                current_timeout - 1,  # Смещаем базу на 1 (0.1с)
+                99,  # 0.1 до 10.0 секунд
+                self._on_timeout_change
             )
             
             # Добавляем информацию о текущих значениях
@@ -400,13 +441,66 @@ class TouchDetector:
             
             self._update_control_window()
     
+    def _on_advanced_filter_toggle(self, value: int) -> None:
+        """
+        Callback для включения/выключения продвинутой фильтрации
+        
+        Args:
+            value: 0 - выключено, 1 - включено
+        """
+        if self.touch_processor is not None:
+            enabled = bool(value)
+            self.touch_processor.set_advanced_filter_enabled(enabled)
+            status = "включена" if enabled else "выключена"
+            self.logger.debug(f"Продвинутая фильтрация {status}")
+            self._update_control_window()
+    
+    def _on_filter_threshold_change(self, value: int) -> None:
+        """
+        Callback для изменения порога фильтрации
+        
+        Args:
+            value: Значение от 0 до 95 (представляет от 5 до 100 пикселей)
+        """
+        if self.touch_processor is not None:
+            threshold = value + 5  # Конвертируем обратно: 0->5, 95->100
+            self.touch_processor.set_filter_distance_threshold(threshold)
+            self.logger.debug(f"Порог фильтрации изменен: {threshold}px")
+            self._update_control_window()
+    
+    def _on_min_movement_change(self, value: int) -> None:
+        """
+        Callback для изменения минимального движения
+        
+        Args:
+            value: Значение от 0 до 49 (представляет от 1 до 50 пикселей)
+        """
+        if self.touch_processor is not None:
+            min_movement = value + 1  # Конвертируем обратно: 0->1, 49->50
+            self.touch_processor.set_filter_min_movement(min_movement)
+            self.logger.debug(f"Минимальное движение изменено: {min_movement}px")
+            self._update_control_window()
+    
+    def _on_timeout_change(self, value: int) -> None:
+        """
+        Callback для изменения таймаута касаний
+        
+        Args:
+            value: Значение от 0 до 99 (представляет от 0.1 до 10.0 секунд)
+        """
+        if self.touch_processor is not None:
+            timeout = (value + 1) / 10.0  # Конвертируем обратно: 0->0.1, 99->10.0
+            self.touch_processor.set_filter_timeout(timeout)
+            self.logger.debug(f"Таймаут касаний изменен: {timeout}с")
+            self._update_control_window()
+    
     def _update_control_window(self) -> None:
         """
         Обновление информации в окне управления
         """
         if hasattr(self, 'control_window_name') and self.touch_processor is not None:
             # Создаем обновленное информационное изображение
-            control_image = np.zeros((450, 500, 3), dtype=np.uint8)
+            control_image = np.zeros((550, 500, 3), dtype=np.uint8)
             cv2.putText(control_image, "Touch Detection Settings", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             
@@ -460,6 +554,34 @@ class TouchDetector:
             
             cv2.putText(control_image, "Depth Scale: 0.8x ... 1.5x", 
                        (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            y_pos += 20
+            
+            # TouchFilter информация
+            filter_status = "ON" if self.touch_processor.get_advanced_filter_enabled() else "OFF"
+            cv2.putText(control_image, f"Advanced Filter: {filter_status}", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 165, 0), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, f"Filter Threshold: {self.touch_processor.get_filter_distance_threshold():.0f}px", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 165, 0), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, f"Min Movement: {self.touch_processor.get_filter_min_movement():.0f}px", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 165, 0), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, f"Touch Timeout: {self.touch_processor.get_filter_timeout():.1f}s", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 165, 0), 1)
+            y_pos += 20
+            
+            # Статистика фильтра
+            filter_stats = self.touch_processor.get_filter_statistics()
+            cv2.putText(control_image, f"Filtered: {filter_stats['total_filtered']}/{filter_stats['total_processed']}", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+            y_pos += 20
+            
+            cv2.putText(control_image, f"Active Touches: {filter_stats['active_touches']}", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
             y_pos += 20
             
             cv2.putText(control_image, "Press 'ESC' to exit", 
