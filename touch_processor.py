@@ -72,7 +72,7 @@ class TouchProcessor:
         
         # Калибровка плоскости проекции
         self.surface_height: Optional[float] = None  # Средняя высота поверхности проекции
-        self.surface_tolerance: float = 0.05  # Допуск для определения поверхности (5 см)
+        self.surface_tolerance: float = 0.2  # Допуск для определения поверхности (5 см)
         self.surface_calibration_points: List[Tuple[int, int, float]] = []  # Точки калибровки поверхности
         
         # Настройки чувствительности
@@ -239,7 +239,7 @@ class TouchProcessor:
         # Пересчитываем параметры детекции на основе уровня чувствительности
         base_threshold = 0.010  # Базовый порог м
         base_min_area = 1500     # Базовая минимальная площадь
-        base_noise_threshold = 0.05  # Базовый порог шума
+        base_noise_threshold = 0.2  # Базовый порог шума
         
         # Чем выше чувствительность, тем ниже пороги
         sensitivity_factor = (11 - self.sensitivity_level) / 10.0  # От 1.0 до 0.1

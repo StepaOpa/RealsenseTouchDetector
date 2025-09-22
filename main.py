@@ -68,6 +68,8 @@ class TouchDetector:
         
         # Создание окна управления с ползунками
         self._setup_control_window()
+        
+        self.show_depth = True
     
     def _setup_logging(self) -> None:
         """
@@ -664,7 +666,10 @@ class TouchDetector:
                 depth_colormap: np.ndarray = self.camera.apply_colormap_to_depth(cropped_depth)
                 
                 # Создаем комбинированное изображение
-                images: np.ndarray = np.hstack((cropped_color, depth_colormap))
+                if self.show_depth:
+                    images: np.ndarray = np.hstack((cropped_color, depth_colormap))
+                else:
+                    images: np.ndarray = np.hstack((cropped_color))
                 
                 # Добавляем текст с информацией
                 cv2.putText(
@@ -676,16 +681,16 @@ class TouchDetector:
                     (255, 255, 255),
                     2
                 )
-                
-                cv2.putText(
-                    images,
-                    'Cropped Depth',
-                    (cropped_color.shape[1] + 10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2
-                )
+                if self.show_depth:
+                    cv2.putText(
+                        images,
+                        'Cropped Depth',
+                        (cropped_color.shape[1] + 10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2
+                    )
                 
                 # Добавляем информацию о размере
                 cv2.putText(
