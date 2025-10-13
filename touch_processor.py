@@ -5,6 +5,7 @@
 
 import cv2
 import numpy as np
+from numpy.linalg import lstsq
 import logging
 from typing import List, Tuple, Optional, Dict, Any
 import time
@@ -54,6 +55,22 @@ class TouchProcessor:
         self.cropped_height: int = cropped_height
         self.target_width: int = target_width
         self.target_height: int = target_height
+        self.plane_A: Optional[float] = None
+        self.plane_B: Optional[float] = None  
+        self.plane_C: Optional[float] = None
+        self.plane_rmse: float = 0.0
+        self.plane_max_error: float = 0.0
+        
+        # Для визуализации
+        self.last_surface_diff: Optional[np.ndarray] = None
+        
+            
+    # Фильтрация по глубине - исключение объектов выше определенного уровня
+        self.min_touch_depth: float = 0.3  # Минимальная глубина касания в метрах (30 см)
+        self.max_touch_depth: float = 2.0  # Максимальная глубина касания в метрах (2 метра)
+        self.enable_depth_filtering: bool = True  # Включить/выключить фильтрацию по глубине
+        
+        
         
         # Коэффициенты масштабирования
         self.scale_x: float = target_width / cropped_width
@@ -115,6 +132,35 @@ class TouchProcessor:
         self.logger.info(f"Коэффициенты масштабирования: X={self.scale_x:.3f}, Y={self.scale_y:.3f}")
         self.logger.info(f"Начальная чувствительность: {self.sensitivity_level}/10, порог касания: {self.touch_threshold:.3f}м")
     
+    def _apply_depth_filter(self, depth_image: np.ndarray, binary_image: np.ndarray) -> np.ndarray:
+        """
+        Применяет фильтрацию по глубине к бинарному изображению
+        
+        Args:
+            depth_image: Изображение глубины в миллиметрах
+            binary_image: Бинарное изображение касаний
+            
+        Returns:
+            Отфильтрованное бинарное изображение
+        """
+        if not self.enable_depth_filtering:
+            return binary_image
+        
+        # Создаем маску допустимой глубины
+        depth_meters = depth_image.astype(np.float32) * 0.001  # Конвертируем в метры
+        
+        # Маска для допустимого диапазона глубины
+        valid_depth_mask = (depth_meters >= self.min_touch_depth) & (depth_meters <= self.max_touch_depth)
+        
+        # Применяем маску к бинарному изображению
+        filtered_binary = binary_image.copy()
+        filtered_binary[~valid_depth_mask] = 0
+        
+        # Морфологическая обработка для устранения шума
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        filtered_binary = cv2.morphologyEx(filtered_binary, cv2.MORPH_OPEN, kernel)
+        
+        return filtered_binary
     def set_background(self, depth_image: np.ndarray) -> None:
         """
         Установка фонового изображения глубины
@@ -192,39 +238,52 @@ class TouchProcessor:
     
     def calibrate_surface_height(self) -> bool:
         """
-        Калибровка высоты поверхности проекции по собранным точкам
-        
-        Returns:
-            True если калибровка прошла успешно
+        Калибровка поверхности с помощью регрессии плоскости
+        z = Ax + By + C
         """
         if len(self.surface_calibration_points) < 3:
-            self.logger.warning("Недостаточно точек для калибровки поверхности (минимум 3)")
+            self.logger.warning("Недостаточно точек для регрессии плоскости (минимум 3)")
             return False
         
-        # Вычисляем медианную глубину для устойчивости к выбросам
-        depths = [point[2] for point in self.surface_calibration_points]
-        self.surface_height = float(np.median(depths))
+        points = np.array(self.surface_calibration_points)
+        x_coords = points[:, 0]  # X пиксели
+        y_coords = points[:, 1]  # Y пиксели  
+        depths = points[:, 2]    # Глубина в метрах
         
-        # Вычисляем стандартное отклонение для оценки качества калибровки
-        std_dev = np.std(depths)
+        # Матрица для уравнения плоскости
+        A_matrix = np.column_stack([x_coords, y_coords, np.ones(len(x_coords))])
         
-        self.logger.info(f"Калибровка поверхности завершена:")
-        self.logger.info(f"  Средняя высота: {self.surface_height:.3f}м")
-        self.logger.info(f"  Стандартное отклонение: {std_dev:.3f}м")
-        self.logger.info(f"  Количество точек: {len(self.surface_calibration_points)}")
+        try:
+            # Решаем методом наименьших квадратов
+            coefficients, residuals, rank, s = lstsq(A_matrix, depths)
+            self.plane_A, self.plane_B, self.plane_C = coefficients
+            
+            # Вычисляем ошибку аппроксимации
+            predicted_depths = A_matrix @ coefficients
+            errors = np.abs(depths - predicted_depths)
+            self.plane_rmse = np.sqrt(np.mean(errors**2))
+            self.plane_max_error = np.max(errors)
+            
+            self.logger.info(f"Плоскость калибрована: z = {self.plane_A:.6f}*x + {self.plane_B:.6f}*y + {self.plane_C:.3f}")
+            self.logger.info(f"Точность: RMSE={self.plane_rmse:.4f}м, MaxError={self.plane_max_error:.4f}м")
+            
+            # Предупреждение если точность низкая
+            if self.plane_rmse > 0.02:
+                self.logger.warning("Низкая точность калибровки! Рекомендуется добавить больше точек.")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка регрессии плоскости: {e}")
+            return False
         
-        # Если стандартное отклонение слишком большое, предупреждаем
-        if std_dev > 0.02:  # 2 см
-            self.logger.warning("Большое отклонение в точках калибровки. Поверхность может быть неровной.")
-        
-        return True
-    
     def clear_surface_calibration(self) -> None:
-        """
-        Очистка точек калибровки поверхности
-        """
+        """Очистка точек калибровки и плоскости"""
         self.surface_calibration_points.clear()
         self.surface_height = None
+        self.plane_A = None
+        self.plane_B = None
+        self.plane_C = None
         self.logger.info("Калибровка поверхности сброшена")
     
     def adjust_sensitivity(self, delta: int) -> None:
@@ -330,9 +389,24 @@ class TouchProcessor:
         # Дополнительная фильтрация шума
         depth_diff[depth_diff < self.depth_noise_threshold] = 0
         
-        # Пороговая обработка
+        # # Пороговая обработка
+        # _, binary = cv2.threshold(depth_diff, self.touch_threshold, 255, cv2.THRESH_BINARY)
+        # binary = binary.astype(np.uint8)
+        
+        # # Морфологическая фильтрация для устранения шума
+        # if self.noise_filter_size > 0:
+        #     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.noise_filter_size, self.noise_filter_size))
+        #     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        #     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        
+        # # Сохраняем бинарное изображение для отладки
+        # self.last_binary_image = binary.copy()
+          # Пороговая обработка
         _, binary = cv2.threshold(depth_diff, self.touch_threshold, 255, cv2.THRESH_BINARY)
         binary = binary.astype(np.uint8)
+        
+        # НОВОЕ: Применяем фильтрацию по глубине
+        binary = self._apply_depth_filter(current_depth, binary)
         
         # Морфологическая фильтрация для устранения шума
         if self.noise_filter_size > 0:
@@ -342,7 +416,7 @@ class TouchProcessor:
         
         # Сохраняем бинарное изображение для отладки
         self.last_binary_image = binary.copy()
-        
+            
         # Поиск контуров
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -366,6 +440,55 @@ class TouchProcessor:
                     touches.append((cx, cy, int(area), float(mean_depth)))
         
         return touches
+    
+    def set_depth_filter_range(self, min_depth: float, max_depth: float) -> None:
+        """
+        Установка диапазона допустимой глубины для касаний
+        
+        Args:
+            min_depth: Минимальная глубина в метрах
+            max_depth: Максимальная глубина в метрах
+        """
+        self.min_touch_depth = max(0.1, min_depth)  # Не менее 10 см
+        self.max_touch_depth = min(10.0, max_depth)  # Не более 10 метров
+        
+        self.logger.info(f"Диапазон глубины касаний установлен: {self.min_touch_depth:.2f} - {self.max_touch_depth:.2f} м")
+
+    def enable_depth_filter(self, enabled: bool) -> None:
+        """
+        Включение/выключение фильтрации по глубине
+        
+        Args:
+            enabled: True для включения фильтрации
+        """
+        self.enable_depth_filtering = enabled
+        self.logger.info(f"Фильтрация по глубине: {'включена' if enabled else 'выключена'}")
+
+    def get_depth_filter_stats(self, current_depth: np.ndarray) -> Dict[str, Any]:
+        """
+        Получение статистики по глубине в текущем кадре
+        
+        Args:
+            current_depth: Текущее изображение глубины
+            
+        Returns:
+            Словарь со статистикой глубины
+        """
+        depth_meters = current_depth.astype(np.float32) * 0.001
+        valid_pixels = depth_meters[(depth_meters > 0) & (depth_meters < 10)]  # Исключаем 0 и большие значения
+        
+        if len(valid_pixels) == 0:
+            return {"valid_pixels": 0}
+        
+        return {
+            "valid_pixels": len(valid_pixels),
+            "min_depth": float(np.min(valid_pixels)),
+            "max_depth": float(np.max(valid_pixels)),
+            "mean_depth": float(np.mean(valid_pixels)),
+            "median_depth": float(np.median(valid_pixels)),
+            "depth_range_set": (self.min_touch_depth, self.max_touch_depth),
+            "filter_enabled": self.enable_depth_filtering
+        }
     
     def _scale_coordinates(self, x: int, y: int) -> Tuple[int, int]:
         """
@@ -500,13 +623,31 @@ class TouchProcessor:
         if self.background_depth is None:
             return []
         
-        # Вычисляем разность с фоном
-        depth_diff = self.background_depth.astype(np.float32) + processed_depth.astype(np.float32) - self.background_threshold
-        # depth_diff = processed_depth.astype(np.float32) - self.background_depth.astype(np.float32)
+        # # Вычисляем разность с фоном
+        # depth_diff = self.background_depth.astype(np.float32) + processed_depth.astype(np.float32) - self.background_threshold
+        # # depth_diff = processed_depth.astype(np.float32) - self.background_depth.astype(np.float32)
 
-        # Нормализуем разность (глубина в миллиметрах)
-        depth_diff = depth_diff * 0.001  # Преобразуем в метры
-        
+        # # Нормализуем разность (глубина в миллиметрах)
+        # depth_diff = depth_diff * 0.001  # Преобразуем в метры
+        # ВЫЧИСЛЕНИЕ РАЗНОСТИ С УЧЕТОМ ПЛОСКОСТИ
+        if self.plane_A is not None:
+            # Используем разность с плоскостью поверхности
+            current_depth_meters = processed_depth.astype(np.float32) * 0.001
+            
+            # Вычисляем ожидаемую поверхность для каждого пикселя
+            height, width = current_depth_meters.shape
+            y_coords, x_coords = np.mgrid[0:height, 0:width]
+            expected_surface = self.plane_A * x_coords + self.plane_B * y_coords + self.plane_C
+            
+            # Разность: положительная = объект ближе к камере (касание)
+            depth_diff = expected_surface - current_depth_meters
+            depth_diff[depth_diff < 0] = 0  # Игнорируем объекты дальше поверхности
+            
+        else:
+            # Fallback: старый метод (разность с фоном)
+            depth_diff = self.background_depth.astype(np.float32) - processed_depth.astype(np.float32)
+            depth_diff = depth_diff * 0.001  # в метры
+            
         # Сохраняем разностное изображение для отладки
         self.last_depth_diff = depth_diff.copy()
         
@@ -549,6 +690,44 @@ class TouchProcessor:
             self.logger.debug(f"Обнаружено касаний: {len(result)}")
         
         return result
+    
+    def get_expected_depth(self, x: int, y: int) -> Optional[float]:
+        """Получить ожидаемую глубину поверхности в точке (x, y)"""
+        if self.plane_A is None:
+            return None
+        return self.plane_A * x + self.plane_B * y + self.plane_C
+
+    def get_depth_deviation(self, x: int, y: int, actual_depth: float) -> Optional[float]:
+        """Получить отклонение от ожидаемой поверхности"""
+        expected = self.get_expected_depth(x, y)
+        if expected is None:
+            return None
+        return actual_depth - expected  # Отрицательное = ближе к камере
+
+    def get_plane_calibration_quality(self) -> Dict[str, Any]:
+        """Оценка качества калибровки плоскости"""
+        if self.plane_A is None:
+            return {"calibrated": False}
+        
+        quality = {
+            "calibrated": True,
+            "rmse": self.plane_rmse,
+            "max_error": self.plane_max_error,
+            "points_count": len(self.surface_calibration_points),
+            "equation": f"z = {self.plane_A:.4f}x + {self.plane_B:.4f}y + {self.plane_C:.3f}"
+        }
+        
+        # Оценка качества
+        if self.plane_rmse < 0.01:
+            quality["quality"] = "excellent"
+        elif self.plane_rmse < 0.02:
+            quality["quality"] = "good" 
+        elif self.plane_rmse < 0.05:
+            quality["quality"] = "fair"
+        else:
+            quality["quality"] = "poor"
+        
+        return quality
     
     def visualize_touches(self, cropped_color: np.ndarray, touches: List[Tuple[int, int, Dict[str, Any]]]) -> np.ndarray:
         """
@@ -648,7 +827,7 @@ class TouchProcessor:
         Returns:
             Словарь со статистической информацией
         """
-        return {
+        stats = {
             "frame_count": self.frame_count,
             "total_touches": self.total_touches_detected,
             "average_touches_per_frame": self.total_touches_detected / max(1, self.frame_count),
@@ -663,8 +842,17 @@ class TouchProcessor:
             "surface_calibrated": self.surface_height is not None,
             "surface_height": self.surface_height,
             "surface_calibration_points": len(self.surface_calibration_points),
-            "depth_noise_threshold": self.depth_noise_threshold
+            "depth_noise_threshold": self.depth_noise_threshold,
+            "surface_plane_calibrated": self.plane_A is not None,
+            "plane_rmse": self.plane_rmse if self.plane_A else None,
+            "plane_max_error": self.plane_max_error if self.plane_A else None,
+            "depth_filter_enabled": self.enable_depth_filtering,
+            "min_touch_depth": self.min_touch_depth,
+            "max_touch_depth": self.max_touch_depth
         }
+        if self.plane_A:
+            stats.update(self.get_plane_calibration_quality())
+        return stats
     
     def configure_detection(self, touch_threshold: Optional[float] = None, 
                           min_area: Optional[int] = None, max_area: Optional[int] = None,

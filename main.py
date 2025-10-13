@@ -31,6 +31,10 @@ class TouchDetector:
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.window_name: str = 'RealSense D435F - Touch Detection'
         
+        self.depth_filter_enabled: bool = True  # Включена ли фильтрация по глубине
+        self.min_touch_depth: float = 0.3  # Минимальная глубина касания в метрах (30 см)
+        self.max_touch_depth: float = 2.0  # Максимальная глубина касания в метрах (2 метра)
+        
         # Калибратор проекции
         self.calibrator: Optional[ProjectionCalibrator] = None
         self.is_calibration_mode: bool = False
@@ -92,6 +96,12 @@ class TouchDetector:
                 target_height=1080
             )
             self.logger.info("TouchProcessor инициализирован")
+            
+            # НАСТРАИВАЕМ ФИЛЬТРАЦИЮ ПО ГЛУБИНЕ
+            self.touch_processor.enable_depth_filter(self.depth_filter_enabled)
+            self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+            self.logger.info(f"Фильтрация по глубине: {'включена' if self.depth_filter_enabled else 'выключена'}")
+            self.logger.info(f"Диапазон глубины: {self.min_touch_depth:.2f}-{self.max_touch_depth:.2f}м")
             
             # Инициализируем Unity коммуникацию
             self._init_unity_communication()
@@ -260,7 +270,37 @@ class TouchDetector:
                 99,  # 0.1 до 10.0 секунд
                 self._on_timeout_change
             )
+                        
+            # Ползунок для включения/выключения фильтрации по глубине
+            depth_filter_enabled = 1 if self.depth_filter_enabled else 0
+            cv2.createTrackbar(
+                "depth filter on/off",
+                self.control_window_name,
+                depth_filter_enabled,
+                1,  # 0 или 1
+                self._on_depth_filter_toggle
+            )
             
+            # Ползунок для минимальной глубины (10см до 2м = 100мм до 2000мм)
+            current_min_depth = int(self.min_touch_depth * 1000)  # Конвертируем в мм
+            cv2.createTrackbar(
+                "min depth (mm)",
+                self.control_window_name,
+                current_min_depth - 100,  # Смещаем базу на 100 (100мм->0)
+                4000,  # 100мм до 2000мм
+                self._on_min_depth_change
+            )
+            
+            # Ползунок для максимальной глубины (0.5м до 5м = 500мм до 5000мм)
+            current_max_depth = int(self.max_touch_depth * 1000)  # Конвертируем в мм
+            cv2.createTrackbar(
+                "max depth (mm)",
+                self.control_window_name,
+                current_max_depth - 500,  # Смещаем базу на 500 (500мм->0)
+                4500,  # 500мм до 5000мм
+                self._on_max_depth_change
+            )
+                
             # Добавляем информацию о текущих значениях
             y_pos = 70
             line_height = 25
@@ -322,6 +362,7 @@ class TouchDetector:
         
         # Отображаем информационное изображение
         cv2.imshow(self.control_window_name, control_image)
+    
     
     def _on_background_threshold_change(self, value: int) -> None:
         """
@@ -506,6 +547,43 @@ class TouchDetector:
             cv2.putText(control_image, "Touch Detection Settings", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             
+        y_pos = 350  # Начинаем после существующей информации
+        
+        # Разделительная линия
+        cv2.line(control_image, (10, y_pos - 10), (440, y_pos - 10), (100, 100, 100), 1)
+        y_pos += 10
+        
+        # Заголовок
+        cv2.putText(control_image, "Depth Filtering:", (10, y_pos), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        y_pos += 25
+        
+        # Статус фильтрации
+        filter_status = "ON" if self.depth_filter_enabled else "OFF"
+        status_color = (0, 255, 0) if self.depth_filter_enabled else (0, 0, 255)
+        cv2.putText(control_image, f"Depth Filter: {filter_status}", 
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
+        y_pos += 20
+        
+        # Диапазон глубины
+        cv2.putText(control_image, f"Depth Range: {self.min_touch_depth:.2f}-{self.max_touch_depth:.2f}m", 
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 165, 0), 1)
+        y_pos += 20
+        
+        # Статистика глубины (если доступна)
+        if hasattr(self, '_last_cropped_depth') and self._last_cropped_depth is not None:
+            depth_stats = self.touch_processor.get_depth_filter_stats(self._last_cropped_depth)
+            if depth_stats and depth_stats['valid_pixels'] > 0:
+                cv2.putText(control_image, f"Current Depth: {depth_stats['mean_depth']:.2f}m", 
+                           (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                y_pos += 15
+                
+                cv2.putText(control_image, f"Min/Max: {depth_stats['min_depth']:.2f}m / {depth_stats['max_depth']:.2f}m", 
+                           (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                y_pos += 15
+            
+            
+            
             # Добавляем информацию о текущих значениях
             y_pos = 70
             line_height = 25
@@ -609,7 +687,6 @@ class TouchDetector:
             # Проверяем, что клик в области обрезанного изображения (левая часть)
             if x < 800:  # Ширина обрезанного изображения
                 # Получаем текущие обрезанные изображения
-                # Нужно получить их из последнего кадра
                 if hasattr(self, '_last_cropped_depth') and self._last_cropped_depth is not None:
                     success = self.touch_processor.add_surface_calibration_point(x, y, self._last_cropped_depth)
                     if success:
@@ -618,14 +695,91 @@ class TouchDetector:
                         
                         # Автоматическая калибровка после сбора достаточного количества точек
                         if points_collected >= self.surface_calibration_points_needed:
-                            if self.touch_processor.calibrate_surface_height():
+                            # ЗАМЕНИТЕ ЭТУ СТРОКУ:
+                            # if self.touch_processor.calibrate_surface_height():
+                            # НА ЭТУ:
+                            if self.touch_processor.calibrate_surface_height():  # Метод уже обновлен!
                                 self.surface_calibration_mode = False
-                                self.logger.info("Калибровка поверхности завершена автоматически")
+                                
+                                # Получаем информацию о качестве калибровки
+                                quality = self.touch_processor.get_plane_calibration_quality()
+                                self.logger.info(f"Калибровка поверхности завершена! Качество: {quality['quality']}")
+                                self.logger.info(f"Уравнение плоскости: {quality['equation']}")
+                                self.logger.info(f"Точность: RMSE={quality['rmse']:.4f}м")
+                                
+                                # Предупреждение если точность низкая
+                                if quality['quality'] in ['fair', 'poor']:
+                                    self.logger.warning("Низкая точность калибровки! Рекомендуется перекалибровать поверхность.")
                             else:
                                 self.logger.warning("Не удалось завершить калибровку поверхности")
                 else:
                     self.logger.warning("Нет данных о глубине для калибровки")
     
+    
+    def _on_depth_filter_toggle(self, value: int) -> None:
+        """
+        Callback для включения/выключения фильтрации по глубине
+        
+        Args:
+            value: 0 - выключено, 1 - включено
+        """
+        self.depth_filter_enabled = bool(value)
+        status = "включена" if self.depth_filter_enabled else "выключена"
+        self.logger.info(f"Фильтрация по глубине {status}")
+        
+        # Применяем настройки к TouchProcessor
+        if self.touch_processor is not None:
+            self.touch_processor.enable_depth_filter(self.depth_filter_enabled)
+            self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+        
+        self._update_control_window()
+
+    def _on_min_depth_change(self, value: int) -> None:
+        """
+        Callback для изменения минимальной глубины
+        
+        Args:
+            value: Значение от 0 до 1900 (представляет от 100мм до 2000мм)
+        """
+        # Конвертируем обратно в метры: 0->0.1м, 1000->1.1м, 1900->2.0м
+        min_depth_meters = (value + 100) / 1000.0
+        
+        # Проверяем, чтобы минимальная глубина была меньше максимальной
+        if min_depth_meters < self.max_touch_depth - 0.1:  # Минимум на 10см меньше
+            self.min_touch_depth = min_depth_meters
+            self.logger.debug(f"Минимальная глубина изменена: {min_depth_meters:.2f}м")
+            
+            # Применяем настройки к TouchProcessor
+            if self.touch_processor is not None:
+                self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+            
+            self._update_control_window()
+        else:
+            self.logger.warning("Минимальная глубина должна быть меньше максимальной хотя бы на 10см")
+
+    def _on_max_depth_change(self, value: int) -> None:
+        """
+        Callback для изменения максимальной глубины
+        
+        Args:
+            value: Значение от 0 до 4500 (представляет от 500мм до 5000мм)
+        """
+        # Конвертируем обратно в метры: 0->0.5м, 1000->1.5м, 4500->5.0м
+        max_depth_meters = (value + 500) / 1000.0
+        
+        # Проверяем, чтобы максимальная глубина была больше минимальной
+        if max_depth_meters > self.min_touch_depth + 0.1:  # Минимум на 10см больше
+            self.max_touch_depth = max_depth_meters
+            self.logger.debug(f"Максимальная глубина изменена: {max_depth_meters:.2f}м")
+            
+            # Применяем настройки к TouchProcessor
+            if self.touch_processor is not None:
+                self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+            
+            self._update_control_window()
+        else:
+            self.logger.warning("Максимальная глубина должна быть больше минимальной хотя бы на 10см")
+            
     def test_camera_connection(self) -> bool:
         """
         Тест подключения камеры RealSense
@@ -700,6 +854,18 @@ class TouchDetector:
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 255, 0),
+                    1
+                )
+                                # Информация о фильтрации по глубине
+                depth_filter_status = "ON" if self.depth_filter_enabled else "OFF"
+                depth_filter_color = (0, 255, 0) if self.depth_filter_enabled else (0, 0, 255)
+                cv2.putText(
+                    images,
+                    f'Depth Filter: {depth_filter_status} ({self.min_touch_depth:.1f}-{self.max_touch_depth:.1f}m)',
+                    (10, 170),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    depth_filter_color,
                     1
                 )
                 
@@ -837,6 +1003,7 @@ class TouchDetector:
                 "Q - exit program"
             ]
         else:
+            # В секции инструкций добавьте новые команды:
             instructions = [
                 "C - enter calibration mode",
                 "V - toggle cropped/original view",
@@ -847,6 +1014,10 @@ class TouchDetector:
                 "+ / - - adjust touch sensitivity",
                 "B - set background (when touch detection on)",
                 "R - reset touch background",
+                "F - toggle depth filtering",  # НОВАЯ КОМАНДА
+                "1/2 - increase/decrease min depth",  # НОВАЯ КОМАНДА
+                "3/4 - increase/decrease max depth",  # НОВАЯ КОМАНДА
+                "5 - auto set depth range",  # НОВАЯ КОМАНДА
                 "Q - exit program"
             ]
         
@@ -1145,11 +1316,66 @@ class TouchDetector:
             
             # Отображаем изображения
             cv2.imshow(self.window_name, display_image)
-            
             # Обработка нажатий клавиш
             key: int = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
+                # НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ФИЛЬТРАЦИИ ПО ГЛУБИНЕ
+            elif key == ord('f'):  # Включение/выключение фильтрации по глубине
+                self.depth_filter_enabled = not self.depth_filter_enabled
+                status = "включена" if self.depth_filter_enabled else "выключена"
+                self.logger.info(f"Фильтрация по глубине {status}")
+                
+                if self.touch_processor is not None:
+                    self.touch_processor.enable_depth_filter(self.depth_filter_enabled)
+            
+            elif key == ord('1'):  # Увеличить минимальную глубину
+                if self.touch_processor is not None:
+                    new_min = min(self.max_touch_depth - 0.1, self.min_touch_depth + 0.1)
+                    if new_min != self.min_touch_depth:
+                        self.min_touch_depth = new_min
+                        self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+                        self.logger.info(f"Минимальная глубина увеличена до: {self.min_touch_depth:.2f}м")
+            
+            elif key == ord('2'):  # Уменьшить минимальную глубину
+                if self.touch_processor is not None:
+                    new_min = max(0.1, self.min_touch_depth - 0.1)
+                    if new_min != self.min_touch_depth:
+                        self.min_touch_depth = new_min
+                        self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+                        self.logger.info(f"Минимальная глубина уменьшена до: {self.min_touch_depth:.2f}м")
+            
+            elif key == ord('3'):  # Увеличить максимальную глубину
+                if self.touch_processor is not None:
+                    new_max = min(5.0, self.max_touch_depth + 0.1)
+                    if new_max != self.max_touch_depth:
+                        self.max_touch_depth = new_max
+                        self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+                        self.logger.info(f"Максимальная глубина увеличена до: {self.max_touch_depth:.2f}м")
+            
+            elif key == ord('4'):  # Уменьшить максимальную глубину
+                if self.touch_processor is not None:
+                    new_max = max(self.min_touch_depth + 0.1, self.max_touch_depth - 0.1)
+                    if new_max != self.max_touch_depth:
+                        self.max_touch_depth = new_max
+                        self.touch_processor.set_depth_filter_range(self.min_touch_depth, self.max_touch_depth)
+                        self.logger.info(f"Максимальная глубина уменьшена до: {self.max_touch_depth:.2f}м")
+            
+            elif key == ord('5'):  # Автоматическая настройка диапазона глубины
+                if (self.touch_processor is not None and 
+                    hasattr(self.touch_processor, 'plane_A') and 
+                    self.touch_processor.plane_A is not None):
+                    
+                    # Автоматическая настройка на основе калиброванной поверхности
+                    if hasattr(self, '_last_cropped_depth') and self._last_cropped_depth is not None:
+                        self.touch_processor.auto_set_depth_range(self._last_cropped_depth, margin=0.2)
+                        
+                        # Обновляем наши переменные
+                        self.min_touch_depth = self.touch_processor.min_touch_depth
+                        self.max_touch_depth = self.touch_processor.max_touch_depth
+                        self.logger.info(f"Автоматически установлен диапазон глубины: {self.min_touch_depth:.2f}-{self.max_touch_depth:.2f}м")
+                else:
+                    self.logger.warning("Для автоматической настройки нужна калиброванная поверхность")
             elif key == ord('c'):
                 # Переход в режим калибровки
                 self._enter_calibration_mode()
