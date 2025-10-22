@@ -1,73 +1,69 @@
-<mxfile host="65bd71144e">
-    <diagram id="diagram-1" name="Call Graph">
-        <mxGraphModel dx="868" dy="1654" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1920" pageHeight="1080" math="0" shadow="0">
-            <root>
-                <mxCell id="0"/>
-                <mxCell id="1" parent="0"/>
-                <mxCell id="n1" value="main()&#xa;main_origin.py:1475" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="60" y="60" width="220" height="60" as="geometry"/>
-                </mxCell>
-                <mxCell id="n2" value="TouchDetector.__init__&#xa;_setup_logging, _init_touch_processor,&#xa;_setup_mouse_callback, _setup_control_window" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="360" y="40" width="300" height="80" as="geometry"/>
-                </mxCell>
-                <mxCell id="n3" value="TouchDetector.run()&#xa;camera.__enter__/start, get_depth_scale, get_intrinsics, _main_loop, finally: unity.close, cv2.destroyAllWindows, camera.__exit__/stop" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="360" y="140" width="460" height="80" as="geometry"/>
-                </mxCell>
-                <mxCell id="n4" value="_main_loop()&#xa;while: camera.get_frames → _create_display_image → show/waitKey" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="860" y="140" width="320" height="80" as="geometry"/>
-                </mxCell>
-                <mxCell id="n5" value="_create_display_image(color, depth)&#xa;if cropped: cropper.crop_both_images&#xa;apply_colormap_to_depth&#xa;if touch on: touch_processor.process_frame&#xa;if unity on: unity.send_touch_coordinates&#xa;debug: touch_processor.get_debug_images&#xa;overlay/labels" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="1330" y="140" width="420" height="140" as="geometry"/>
-                </mxCell>
-                <mxCell id="n6" value="TouchProcessor.process_frame()&#xa;→ _preprocess_depth_image&#xa;→ virtual_camera_distance_adjustment&#xa;→ update_background (opt)&#xa;→ _detect_touch_contours&#xa;→ _stabilize_touches&#xa;→ _filter_touches&#xa;→ scale to screen coords" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="1360" y="350" width="360" height="180" as="geometry"/>
-                </mxCell>
-                <mxCell id="n7" value="UnityCommunication.send_touch_coordinates()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="2050" y="230" width="260" height="60" as="geometry"/>
-                </mxCell>
-                <mxCell id="n8" value="ProjectionAreaCropper&#xa;crop_both_images&#xa;visualize_crop_area&#xa;transform_point_to_cropped" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="2030" y="70" width="260" height="100" as="geometry"/>
-                </mxCell>
-                <mxCell id="n9" value="RealSenseCamera&#xa;start/stop&#xa;get_frames&#xa;get_depth_scale&#xa;get_intrinsics&#xa;apply_colormap_to_depth" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1f5fe;strokeColor=#29b6f6;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="360" y="260" width="260" height="140" as="geometry"/>
-                </mxCell>
-                <mxCell id="n10" value="ProjectionCalibrator.calibrate()&#xa;(по клавише &#39;C&#39;)" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=3 3;fillColor=#f4f4f4;strokeColor=#999999;fontSize=12" parent="1" vertex="1">
-                    <mxGeometry x="860" y="-10" width="320" height="60" as="geometry"/>
-                </mxCell>
-                <mxCell id="e1" value="" style="endArrow=block;strokeWidth=1.5" parent="1" source="n1" target="n2" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e2" value="" style="endArrow=block;strokeWidth=1.5" parent="1" source="n1" target="n3" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e3" value="enter/start" style="endArrow=block;strokeWidth=1.5" parent="1" source="n3" target="n9" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e4" value="" style="endArrow=block;strokeWidth=1.5" parent="1" source="n3" target="n4" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e5" value="get_frames" style="endArrow=block;strokeWidth=1.5" parent="1" source="n4" target="n9" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e6" value="_create_display_image" style="endArrow=block;strokeWidth=1.5" parent="1" source="n4" target="n5" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e7" value="crop_both_images" style="endArrow=block;strokeWidth=1.5" parent="1" source="n5" target="n8" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e8" value="apply_colormap_to_depth" style="endArrow=block;strokeWidth=1.5" parent="1" source="n5" target="n9" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e9" value="process_frame" style="endArrow=block;strokeWidth=1.5" parent="1" source="n5" target="n6" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e10" value="send_touch_coordinates" style="endArrow=block;strokeWidth=1.5" parent="1" source="n5" target="n7" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e11" value="&#39;C&#39; calibrate" style="endArrow=block;strokeWidth=1.5;dashed=1;dashPattern=3 3" parent="1" source="n4" target="n10" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-            </root>
-        </mxGraphModel>
-    </diagram>
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 YaBrowser/25.8.0.0 Safari/537.36" version="28.2.7">
+  <diagram name="Страница — 1" id="1FDPKpo-jybjG9107uvA">
+    <mxGraphModel dx="784" dy="774" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="ZmjAIhtJf7EqWXzUNCuf-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" parent="1" source="ZmjAIhtJf7EqWXzUNCuf-1" target="ZmjAIhtJf7EqWXzUNCuf-3" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-1" value="press &#39;c&#39;" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="ZmjAIhtJf7EqWXzUNCuf-4">
+          <mxGeometry x="-0.0786" y="-1" relative="1" as="geometry">
+            <mxPoint y="1" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.25;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ZmjAIhtJf7EqWXzUNCuf-1" target="wnEclp6y8YGZyIKxjAbZ-10">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="300" y="280" />
+              <mxPoint x="300" y="280" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-12" value="press &#39;v&#39;" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="wnEclp6y8YGZyIKxjAbZ-11">
+          <mxGeometry x="-0.6353" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ZmjAIhtJf7EqWXzUNCuf-1" value="&lt;div&gt;MainApplication&lt;/div&gt;main()&lt;div&gt;отображение color и depth потоков&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="217.5" y="120" width="225" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ZmjAIhtJf7EqWXzUNCuf-3" target="wnEclp6y8YGZyIKxjAbZ-3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ZmjAIhtJf7EqWXzUNCuf-3" value="self.cropper.select_crop_region()" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="472" y="260" width="225" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="wnEclp6y8YGZyIKxjAbZ-3" target="wnEclp6y8YGZyIKxjAbZ-10">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="400.0000000000001" y="570" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-6" value="да" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="wnEclp6y8YGZyIKxjAbZ-5">
+          <mxGeometry x="0.4387" y="1" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="wnEclp6y8YGZyIKxjAbZ-3" target="ZmjAIhtJf7EqWXzUNCuf-3">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="810" y="484" />
+              <mxPoint x="810" y="300" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-9" value="нет" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="wnEclp6y8YGZyIKxjAbZ-8">
+          <mxGeometry x="-0.778" y="1" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-3" value="points[] == 4?" style="rhombus;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="517" y="413.5" width="135" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="wnEclp6y8YGZyIKxjAbZ-10" value="crop_image() каждый кадр" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="270" y="510" width="120" height="60" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
 </mxfile>
