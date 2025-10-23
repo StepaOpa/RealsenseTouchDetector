@@ -2,6 +2,9 @@ from realsense_camera import RealSenseCamera
 import cv2
 from image_cropper import ImageCropper
 from surface_calibrator import SurfaceCalibrator
+from touch_processor import (
+    TouchProcessor,
+)  # Предполагаем, что класс в файле touch_processor.py
 from typing import List, Tuple
 
 
@@ -12,9 +15,12 @@ class MainApplication:
         self.camera = RealSenseCamera(width, height, fps)
         self.cropper: ImageCropper = None
         self.surface_calibrator: SurfaceCalibrator = None
+        self.touch_processor: TouchProcessor = None  # <-- НОВОЕ
+
         # Флаги
         self.running = False
         self.in_crop_mode = False
+        self.surface_calibrated = False  # <-- НОВОЕ: флаг успешной калибровки
 
         # Сырой поток
         self.color_image = None
@@ -62,6 +68,18 @@ class MainApplication:
             cropped_depth = self.cropper.crop_image(self.depth_image)
 
             if cropped_color is not None and cropped_depth is not None:
+                # === НОВОЕ: Обработка касаний на кропнутом кадре ===
+                if self.surface_calibrated and self.touch_processor:
+                    # Обновляем интринсики, если они изменились (опционально)
+                    intrinsics, _ = self.camera.get_intrinsics()
+                    if intrinsics:
+                        self.touch_processor.set_intrinsics(intrinsics)
+
+                    # Обработка кропнутого кадра
+                    touches = self.touch_processor.process_frame(cropped_depth)
+                    # touches = [(x, y), ...] в пикселях кропнутого изображения
+                    print(f"Касания в кропнутом кадре: {touches}")
+
                 depth_colormap = self.camera.apply_colormap_to_depth(cropped_depth)
                 self._show_frames(cropped_color, depth_colormap)
             else:
@@ -69,6 +87,14 @@ class MainApplication:
                 depth_colormap = self.camera.apply_colormap_to_depth(self.depth_image)
                 self._show_frames(self.color_image, depth_colormap)
         else:
+            # === Обработка на полном кадре, если не в режиме кропа ===
+            if self.surface_calibrated and self.touch_processor:
+                intrinsics, _ = self.camera.get_intrinsics()
+                if intrinsics:
+                    self.touch_processor.set_intrinsics(intrinsics)
+                touches = self.touch_processor.process_frame(self.depth_image)
+                # print(f"Касания в полном кадре: {touches}")
+
             depth_colormap = self.camera.apply_colormap_to_depth(self.depth_image)
             self._show_frames(self.color_image, depth_colormap)
 
@@ -123,16 +149,25 @@ class MainApplication:
 
         if plane:
             print("Плоскость пола:", plane)
-            # Теперь можно фильтровать облако точек по высоте над полом
+            # === ИНИЦИАЛИЗАЦИЯ TouchProcessor ===
+            self.touch_processor = TouchProcessor()
+            self.touch_processor.set_floor_plane(plane)
+
+            # Устанавливаем интринсики
+            intrinsics, _ = self.camera.get_intrinsics()
+            if intrinsics:
+                self.touch_processor.set_intrinsics(intrinsics)
+
+            # Настройки фильтрации (пример)
+            self.touch_processor.set_height_range(0.0, 0.15)  # 0-15 см над плоскостью
+            self.touch_processor.set_area_range(200, 2000)  # фильтр по площади
+
+            self.surface_calibrated = True
+            print("TouchProcessor инициализирован и готов к работе.")
+            print("Бинарный поток отображается в окне 'Binary Touch Detection'.")
         else:
             print("Не удалось оценить плоскость")
-
-        # calibrator.set_2d_points(points_2d)
-        # self.points_3d = calibrator.compute_3d_points()
-
-        # print("3D-координаты (в метрах):")
-        # for i, (x, y, z) in enumerate(self.points_3d):
-        #     print(f"  Точка {i+1}: ({x:.3f}, {y:.3f}, {z:.3f})")
+            self.surface_calibrated = False
 
     def _cleanup(self):
         """Очистка ресурсов: остановка камеры и закрытие окон."""
@@ -140,6 +175,11 @@ class MainApplication:
             self.camera.__exit__(None, None, None)
         except Exception as e:
             print(f"Ошибка при остановке камеры: {e}")
+
+        # Закрытие окон TouchProcessor (если был инициализирован)
+        if self.touch_processor:
+            self.touch_processor.close()  # Вызываем метод close, если он есть в вашем TouchProcessor
+
         cv2.destroyAllWindows()
         self.running = False
 
