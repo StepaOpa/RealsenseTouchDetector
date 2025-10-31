@@ -67,11 +67,24 @@ class TouchProcessor:
         self.plane_A: Optional[float] = None
         self.plane_B: Optional[float] = None
         self.plane_C: Optional[float] = None
+        self.plane_D: Optional[float] = None
         self.plane_rmse: float = 0.0
         self.plane_max_error: float = 0.0
+        # Вращение изображения на 180 градусов (для проекторов, установленных вверх ногами)
+        self.flip_180_enabled: bool = False
 
         self.touch_offset_x: int = 0
         self.touch_offset_y: int = 0
+        # Ограничение зоны детекции относительно калиброванной плоскости
+        self.surface_detection_enabled: bool = (
+            True  # Включено ли ограничение по поверхности
+        )
+        self.surface_min_offset: float = (
+            -0.05
+        )  # Мин. отклонение от плоскости (в метрах, т.е. 5 см ближе)
+        self.surface_max_offset: float = (
+            0.10  # Макс. отклонение от плоскости (в метрах, т.е. 10 см дальше)
+        )
 
         # Для визуализации
         self.last_surface_diff: Optional[np.ndarray] = None
@@ -171,6 +184,15 @@ class TouchProcessor:
             f"Начальная чувствительность: {self.sensitivity_level}/10, порог касания: {self.touch_threshold:.3f}м"
         )
 
+    def enable_flip_180(self, enabled: bool) -> None:
+        self.flip_180_enabled = enabled
+        self.logger.debug(
+            f"Разворот изображения на 180°: {'включён' if enabled else 'выключён'}"
+        )
+
+    def is_flip_180_enabled(self) -> bool:
+        return self.flip_180_enabled
+
     def get_min_touch_area(self) -> int:
         return self.min_touch_area
 
@@ -184,6 +206,27 @@ class TouchProcessor:
     def set_max_touch_area(self, value: int) -> None:
         self.max_touch_area = max(self.min_touch_area, value)
         self.logger.debug(f"Максимальная площадь касания: {self.max_touch_area}")
+
+    def enable_surface_detection(self, enabled: bool) -> None:
+        self.surface_detection_enabled = enabled
+        self.logger.debug(
+            f"Ограничение по поверхности: {'включено' if enabled else 'выключено'}"
+        )
+
+    def is_surface_detection_enabled(self) -> bool:
+        return self.surface_detection_enabled
+
+    def set_surface_detection_range(self, min_offset: float, max_offset: float) -> None:
+        self.surface_min_offset = min_offset
+        self.surface_max_offset = max(
+            max_offset, min_offset + 0.01
+        )  # избегаем перекрытия
+        self.logger.debug(
+            f"Диапазон отклонения от поверхности: [{min_offset:.3f}, {max_offset:.3f}] м"
+        )
+
+    def get_surface_detection_range(self) -> Tuple[float, float]:
+        return self.surface_min_offset, self.surface_max_offset
 
     def _apply_depth_filter(
         self, depth_image: np.ndarray, binary_image: np.ndarray
@@ -305,8 +348,8 @@ class TouchProcessor:
 
     def calibrate_surface_height(self) -> bool:
         """
-        Калибровка поверхности с помощью регрессии плоскости
-        z = Ax + By + C
+        Калибровка поверхности с помощью регрессии общей плоскости:
+        A*x + B*y + C*z + D = 0
         """
         if len(self.surface_calibration_points) < 3:
             self.logger.warning(
@@ -315,37 +358,50 @@ class TouchProcessor:
             return False
 
         points = np.array(self.surface_calibration_points)
-        x_coords = points[:, 0]  # X пиксели
-        y_coords = points[:, 1]  # Y пиксели
-        depths = points[:, 2]  # Глубина в метрах
+        x_coords = points[:, 0].astype(np.float64)  # пиксели
+        y_coords = points[:, 1].astype(np.float64)  # пиксели
+        z_coords = points[:, 2].astype(np.float64)  # глубина в метрах
 
-        # Матрица для уравнения плоскости
-        A_matrix = np.column_stack([x_coords, y_coords, np.ones(len(x_coords))])
+        # Строим матрицу: [x, y, z, 1]
+        A_matrix = np.column_stack(
+            [x_coords, y_coords, z_coords, np.ones_like(x_coords)]
+        )
 
+        # Ищем вектор [A, B, C, D], минимизирующий ||A·x + B·y + C·z + D|| при ||[A,B,C,D]|| = 1
+        # Это сингулярное разложение (SVD): наименьший сингулярный вектор — решение
         try:
-            # Решаем методом наименьших квадратов
-            coefficients, residuals, rank, s = lstsq(A_matrix, depths)
-            self.plane_A, self.plane_B, self.plane_C = coefficients
+            _, _, Vt = np.linalg.svd(A_matrix)
+            plane = Vt[-1]  # Последняя строка V^T — наименьший сингулярный вектор
+            A, B, C, D = plane
 
-            # Вычисляем ошибку аппроксимации
-            predicted_depths = A_matrix @ coefficients
-            errors = np.abs(depths - predicted_depths)
-            self.plane_rmse = np.sqrt(np.mean(errors**2))
-            self.plane_max_error = np.max(errors)
+            # Нормализуем: делаем C положительным (чтобы нормаль смотрела "вверх")
+            if C < 0:
+                A, B, C, D = -A, -B, -C, -D
+
+            # Сохраняем коэффициенты
+            self.plane_A = float(A)
+            self.plane_B = float(B)
+            self.plane_C = float(C)
+            self.plane_D = float(D)
+
+            # Оценка ошибки: расстояние от точек до плоскости
+            distances = np.abs(
+                A * x_coords + B * y_coords + C * z_coords + D
+            ) / np.sqrt(A**2 + B**2 + C**2)
+            self.plane_rmse = float(np.sqrt(np.mean(distances**2)))
+            self.plane_max_error = float(np.max(distances))
 
             self.logger.info(
-                f"Плоскость калибрована: z = {self.plane_A:.6f}*x + {self.plane_B:.6f}*y + {self.plane_C:.3f}"
+                f"Плоскость калибрована: {A:.6f}x + {B:.6f}y + {C:.6f}z + {D:.6f} = 0"
             )
             self.logger.info(
                 f"Точность: RMSE={self.plane_rmse:.4f}м, MaxError={self.plane_max_error:.4f}м"
             )
 
-            # Предупреждение если точность низкая
             if self.plane_rmse > 0.02:
                 self.logger.warning(
                     "Низкая точность калибровки! Рекомендуется добавить больше точек."
                 )
-
             return True
 
         except Exception as e:
@@ -359,6 +415,7 @@ class TouchProcessor:
         self.plane_A = None
         self.plane_B = None
         self.plane_C = None
+        self.plane_D = None  # ← добавлено
         self.logger.info("Калибровка поверхности сброшена")
 
     def adjust_sensitivity(self, delta: int) -> None:
@@ -753,24 +810,33 @@ class TouchProcessor:
 
         # # Нормализуем разность (глубина в миллиметрах)
         # depth_diff = depth_diff * 0.001  # Преобразуем в метры
-        # ВЫЧИСЛЕНИЕ РАЗНОСТИ С УЧЕТОМ ПЛОСКОСТИ
+        # ВЫЧИСЛЕНИЕ РАЗНОСТИ С УЧЕТОМ ПЛОСКОСТИ И МАСКИ ОТКЛОНЕНИЯ
         if self.plane_A is not None:
-            # Используем разность с плоскостью поверхности
             current_depth_meters = processed_depth.astype(np.float32) * 0.001
-
-            # Вычисляем ожидаемую поверхность для каждого пикселя
             height, width = current_depth_meters.shape
-            y_coords, x_coords = np.mgrid[0:height, 0:width]
+            y_coords, x_coords = np.mgrid[0:height, 0:width].astype(np.float32)
+
+            # Ожидаемая глубина на плоскости: z = -(A*x + B*y + D)/C
             expected_surface = (
-                self.plane_A * x_coords + self.plane_B * y_coords + self.plane_C
+                -(self.plane_A * x_coords + self.plane_B * y_coords + self.plane_D)
+                / self.plane_C
             )
 
-            # Разность: положительная = объект ближе к камере (касание)
+            # Разность: положительная = объект ближе к камере
             depth_diff = expected_surface - current_depth_meters
-            depth_diff[depth_diff < 0] = 0  # Игнорируем объекты дальше поверхности
+            depth_diff[depth_diff < 0] = 0  # Только объекты ближе поверхности
 
+            # --- НОВОЕ: маска по отклонению от плоскости ---
+            if self.surface_detection_enabled:
+                deviation = (
+                    current_depth_meters - expected_surface
+                )  # <0 = ближе, >0 = дальше
+                valid_mask = (deviation >= self.surface_min_offset) & (
+                    deviation <= self.surface_max_offset
+                )
+                depth_diff = depth_diff * valid_mask.astype(np.float32)
         else:
-            # Fallback: старый метод (разность с фоном)
+            # Fallback: разность с фоном
             depth_diff = self.background_depth.astype(
                 np.float32
             ) - processed_depth.astype(np.float32)
@@ -819,33 +885,32 @@ class TouchProcessor:
 
     def get_expected_depth(self, x: int, y: int) -> Optional[float]:
         """Получить ожидаемую глубину поверхности в точке (x, y)"""
-        if self.plane_A is None:
+        if self.plane_A is None or self.plane_C == 0:
             return None
-        return self.plane_A * x + self.plane_B * y + self.plane_C
+        return float(
+            -(self.plane_A * x + self.plane_B * y + self.plane_D) / self.plane_C
+        )
 
     def get_depth_deviation(
         self, x: int, y: int, actual_depth: float
     ) -> Optional[float]:
-        """Получить отклонение от ожидаемой поверхности"""
+        """Получить отклонение от ожидаемой поверхности (положительное = ближе к камере)"""
         expected = self.get_expected_depth(x, y)
         if expected is None:
             return None
-        return actual_depth - expected  # Отрицательное = ближе к камере
+        return expected - actual_depth  # >0 → касание
 
     def get_plane_calibration_quality(self) -> Dict[str, Any]:
         """Оценка качества калибровки плоскости"""
         if self.plane_A is None:
             return {"calibrated": False}
-
         quality = {
             "calibrated": True,
             "rmse": self.plane_rmse,
             "max_error": self.plane_max_error,
             "points_count": len(self.surface_calibration_points),
-            "equation": f"z = {self.plane_A:.4f}x + {self.plane_B:.4f}y + {self.plane_C:.3f}",
+            "equation": f"{self.plane_A:.4f}x + {self.plane_B:.4f}y + {self.plane_C:.4f}z + {self.plane_D:.4f} = 0",
         }
-
-        # Оценка качества
         if self.plane_rmse < 0.01:
             quality["quality"] = "excellent"
         elif self.plane_rmse < 0.02:
@@ -854,7 +919,6 @@ class TouchProcessor:
             quality["quality"] = "fair"
         else:
             quality["quality"] = "poor"
-
         return quality
 
     def visualize_touches(
@@ -980,6 +1044,7 @@ class TouchProcessor:
             "depth_filter_enabled": self.enable_depth_filtering,
             "min_touch_depth": self.min_touch_depth,
             "max_touch_depth": self.max_touch_depth,
+            "plane_D": self.plane_D if self.plane_A else None,
         }
         if self.plane_A:
             stats.update(self.get_plane_calibration_quality())

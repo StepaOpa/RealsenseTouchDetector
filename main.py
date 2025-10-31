@@ -14,6 +14,9 @@ from crop_to_calibrated_area import ProjectionAreaCropper
 from touch_processor import TouchProcessor
 from unity_communication import UnityCommunication
 
+import json
+import os
+
 
 class TouchDetector:
     """
@@ -23,14 +26,21 @@ class TouchDetector:
     def __init__(self, camera: RealSenseCamera) -> None:
         """
         Инициализация детектора касаний
-
         Args:
             camera: Экземпляр камеры RealSense
+            settings_file: Путь к файлу настроек (по умолчанию "touch_detector_settings.json")
         """
         self.camera: RealSenseCamera = camera
+        self.settings_file: str = settings_file  # Сохраняем имя файла настроек
         self.logger: logging.Logger = logging.getLogger(__name__)
         self.window_name: str = "RealSense D435F - Touch Detection"
+        self.camera_width: int = 1280
+        self.camera_height: int = 720
+        self.crop_width: int = 1024
+        self.crop_height: int = 768
 
+        # --- НАЧАЛО: Инициализация параметров с значениями по умолчанию ---
+        # Эти значения будут перезаписаны при загрузке из файла, если он существует
         self.depth_filter_enabled: bool = True  # Включена ли фильтрация по глубине
         self.min_touch_depth: float = (
             0.3  # Минимальная глубина касания в метрах (30 см)
@@ -38,6 +48,42 @@ class TouchDetector:
         self.max_touch_depth: float = (
             2.0  # Максимальная глубина касания в метрах (2 метра)
         )
+        self.show_cropped: bool = (
+            False  # Режим отображения: False - исходные, True - обрезанные
+        )
+        self.show_projection_area: bool = (
+            True  # Показывать ли область проекции на исходном изображении
+        )
+        self.touch_detection_enabled: bool = False  # Включена ли детекция касаний
+        self.show_touches: bool = True  # Показывать ли касания на изображении
+        self.show_debug_images: bool = (
+            False  # Показывать ли отладочные изображения детекции
+        )
+        self.unity_enabled: bool = True  # Включена ли отправка в Unity
+        self.unity_host: str = "127.0.0.1"  # IP адрес Unity
+        self.unity_port: int = 8052  # UDP порт для Unity
+        self.surface_calibration_mode: bool = (
+            False  # Режим калибровки поверхности (обычно False при запуске)
+        )
+        self.show_depth: bool = True
+
+        # Параметры, хранящиеся в TouchProcessor (если он инициализирован)
+        # Эти значения по умолчанию будут установлены в TouchProcessor при его инициализации
+        # или загружены из настроек и переданы ему.
+        self.default_touch_offset_x: int = 0
+        self.default_touch_offset_y: int = 0
+        self.default_surface_filter_enabled: bool = False
+        self.default_surface_min_offset: float = -0.1  # в метрах
+        self.default_surface_max_offset: float = 0.1  # в метрах
+        self.default_flip_180: bool = False
+        self.default_depth_offset: int = 0  # в мм
+        self.default_depth_scale_factor: float = 1.0
+        self.default_unity_send_enabled: bool = True
+        self.default_min_depth_mm: int = 300  # в мм (0.3м)
+        self.default_max_depth_mm: int = 2000  # в мм (2.0м)
+        self.default_min_touch_area: int = 100
+        self.default_max_touch_area: int = 5000
+        # --- КОНЕЦ: Инициализация параметров ---
 
         # Калибратор проекции
         self.calibrator: Optional[ProjectionCalibrator] = None
@@ -45,49 +91,211 @@ class TouchDetector:
 
         # Обрезчик проекции
         self.cropper: ProjectionAreaCropper = ProjectionAreaCropper(
-            output_size=(800, 600)
-        )
-        self.show_cropped: bool = (
-            False  # Режим отображения: False - исходные, True - обрезанные
-        )
-        self.show_projection_area: bool = (
-            True  # Показывать ли область проекции на исходном изображении
+            output_size=(self.crop_width, self.crop_height)
         )
 
         # Процессор касаний
         self.touch_processor: Optional[TouchProcessor] = None
-        self.touch_detection_enabled: bool = False  # Включена ли детекция касаний
-        self.show_touches: bool = True  # Показывать ли касания на изображении
         self.current_touches: List = []  # Текущие обнаруженные касания
-        self.show_debug_images: bool = (
-            False  # Показывать ли отладочные изображения детекции
-        )
 
         # Unity коммуникация
         self.unity_comm: Optional[UnityCommunication] = None
-        self.unity_enabled: bool = True  # Включена ли отправка в Unity
-        self.unity_host: str = "127.0.0.1"  # IP адрес Unity
-        self.unity_port: int = 8052  # UDP порт для Unity
 
         # Калибровка поверхности
-        self.surface_calibration_mode: bool = False  # Режим калибровки поверхности
         self.surface_calibration_points_needed: int = (
             5  # Количество точек для калибровки
         )
+
+        # --- ЗАГРУЗКА НАСТРОЕК ---
+        self._load_settings()
 
         # Инициализация камеры
         self._setup_logging()
 
         # Инициализируем процессор касаний если есть калибровка
+        # (Это может изменить параметры, хранящиеся в touch_processor)
         self._init_touch_processor()
 
         # Настройка обработчика мыши
         self._setup_mouse_callback()
 
         # Создание окна управления с ползунками
+        # (Ползунки будут установлены в значения, загруженные из файла)
         self._setup_control_window()
 
-        self.show_depth = True
+        # --- МЕТОД ЗАГРУЗКИ НАСТРОЕК ---
+
+    def _load_settings(self) -> None:
+        """
+        Загружает настройки из JSON файла.
+        """
+        if not os.path.exists(self.settings_file):
+            self.logger.info(
+                f"Файл настроек {self.settings_file} не найден. Используются значения по умолчанию."
+            )
+            return
+
+        try:
+            with open(self.settings_file, "r", encoding="utf-8") as f:
+                saved_data = json.load(f)
+
+            # Загружаем параметры, хранящиеся в TouchDetector
+            self.depth_filter_enabled = saved_data.get(
+                "depth_filter_enabled", self.depth_filter_enabled
+            )
+            self.min_touch_depth = saved_data.get(
+                "min_touch_depth", self.min_touch_depth
+            )
+            self.max_touch_depth = saved_data.get(
+                "max_touch_depth", self.max_touch_depth
+            )
+            self.show_cropped = saved_data.get("show_cropped", self.show_cropped)
+            self.show_projection_area = saved_data.get(
+                "show_projection_area", self.show_projection_area
+            )
+            self.touch_detection_enabled = saved_data.get(
+                "touch_detection_enabled", self.touch_detection_enabled
+            )
+            self.show_touches = saved_data.get("show_touches", self.show_touches)
+            self.show_debug_images = saved_data.get(
+                "show_debug_images", self.show_debug_images
+            )
+            self.unity_enabled = saved_data.get("unity_enabled", self.unity_enabled)
+            self.unity_host = saved_data.get("unity_host", self.unity_host)
+            self.unity_port = saved_data.get("unity_port", self.unity_port)
+            self.show_depth = saved_data.get("show_depth", self.show_depth)
+            # Загружаем параметры, которые будут применены к TouchProcessor при его инициализации
+            self.default_touch_offset_x = saved_data.get(
+                "default_touch_offset_x", self.default_touch_offset_x
+            )
+            self.default_touch_offset_y = saved_data.get(
+                "default_touch_offset_y", self.default_touch_offset_y
+            )
+            self.default_surface_filter_enabled = saved_data.get(
+                "default_surface_filter_enabled", self.default_surface_filter_enabled
+            )
+            self.default_surface_min_offset = saved_data.get(
+                "default_surface_min_offset", self.default_surface_min_offset
+            )
+            self.default_surface_max_offset = saved_data.get(
+                "default_surface_max_offset", self.default_surface_max_offset
+            )
+            self.default_flip_180 = saved_data.get(
+                "default_flip_180", self.default_flip_180
+            )
+            self.default_depth_offset = saved_data.get(
+                "default_depth_offset", self.default_depth_offset
+            )
+            self.default_depth_scale_factor = saved_data.get(
+                "default_depth_scale_factor", self.default_depth_scale_factor
+            )
+            self.default_unity_send_enabled = saved_data.get(
+                "default_unity_send_enabled", self.default_unity_send_enabled
+            )
+            self.default_min_depth_mm = saved_data.get(
+                "default_min_depth_mm", self.default_min_depth_mm
+            )
+            self.default_max_depth_mm = saved_data.get(
+                "default_max_depth_mm", self.default_max_depth_mm
+            )
+            self.default_min_touch_area = saved_data.get(
+                "default_min_touch_area", self.default_min_touch_area
+            )
+            self.default_max_touch_area = saved_data.get(
+                "default_max_touch_area", self.default_max_touch_area
+            )
+
+            self.logger.info(f"Настройки загружены из {self.settings_file}")
+        except Exception as e:
+            self.logger.error(
+                f"Ошибка загрузки настроек из {self.settings_file}: {e}. Используются значения по умолчанию."
+            )
+
+    # --- МЕТОД СОХРАНЕНИЯ НАСТРОЕК ---
+    def _save_settings(self) -> None:
+        """
+        Сохраняет текущие настройки в JSON файл.
+        """
+        settings_to_save = {
+            "depth_filter_enabled": self.depth_filter_enabled,
+            "min_touch_depth": self.min_touch_depth,
+            "max_touch_depth": self.max_touch_depth,
+            "show_cropped": self.show_cropped,
+            "show_projection_area": self.show_projection_area,
+            "touch_detection_enabled": self.touch_detection_enabled,
+            "show_touches": self.show_touches,
+            "show_debug_images": self.show_debug_images,
+            "unity_enabled": self.unity_enabled,
+            "unity_host": self.unity_host,
+            "unity_port": self.unity_port,
+            "show_depth": self.show_depth,
+            # Параметры, которые хранятся в TouchProcessor (если он инициализирован)
+            # Сохраняем текущие значения из TouchProcessor, если он есть, иначе из default_*
+            "default_touch_offset_x": (
+                self.touch_processor.touch_offset_x
+                if self.touch_processor
+                else self.default_touch_offset_x
+            ),
+            "default_touch_offset_y": (
+                self.touch_processor.touch_offset_y
+                if self.touch_processor
+                else self.default_touch_offset_y
+            ),
+            "default_surface_filter_enabled": (
+                self.touch_processor.is_surface_detection_enabled()
+                if self.touch_processor
+                else self.default_surface_filter_enabled
+            ),
+            "default_surface_min_offset": (
+                self.touch_processor.surface_min_offset
+                if self.touch_processor
+                else self.default_surface_min_offset
+            ),
+            "default_surface_max_offset": (
+                self.touch_processor.surface_max_offset
+                if self.touch_processor
+                else self.default_surface_max_offset
+            ),
+            "default_flip_180": (
+                self.touch_processor.is_flip_180_enabled()
+                if self.touch_processor
+                else self.default_flip_180
+            ),
+            "default_depth_offset": (
+                self.touch_processor.get_depth_offset()
+                if self.touch_processor
+                else self.default_depth_offset
+            ),
+            "default_depth_scale_factor": (
+                self.touch_processor.get_depth_scale_factor()
+                if self.touch_processor
+                else self.default_depth_scale_factor
+            ),
+            "default_unity_send_enabled": self.unity_enabled,  # или отдельный флаг в TouchProcessor, если есть
+            "default_min_depth_mm": int(
+                self.min_touch_depth * 1000
+            ),  # Сохраняем как мм
+            "default_max_depth_mm": int(
+                self.max_touch_depth * 1000
+            ),  # Сохраняем как мм
+            "default_min_touch_area": (
+                self.touch_processor.get_min_touch_area()
+                if self.touch_processor
+                else self.default_min_touch_area
+            ),
+            "default_max_touch_area": (
+                self.touch_processor.get_max_touch_area()
+                if self.touch_processor
+                else self.default_max_touch_area
+            ),
+        }
+
+        try:
+            with open(self.settings_file, "w", encoding="utf-8") as f:
+                json.dump(settings_to_save, f, ensure_ascii=False, indent=4)
+            self.logger.info(f"Настройки сохранены в {self.settings_file}")
+        except Exception as e:
+            self.logger.error(f"Ошибка сохранения настроек в {self.settings_file}: {e}")
 
     def _setup_logging(self) -> None:
         """
@@ -103,14 +311,38 @@ class TouchDetector:
         """
         if self.cropper.is_calibrated:
             self.touch_processor = TouchProcessor(
-                cropped_width=800,
-                cropped_height=600,
+                cropped_width=self.crop_width,
+                cropped_height=self.crop_height,
                 target_width=1920,
                 target_height=1080,
             )
             self.logger.info("TouchProcessor инициализирован")
 
-            # НАСТРАИВАЕМ ФИЛЬТРАЦИЮ ПО ГЛУБИНЕ
+            # --- ПРИМЕНЕНИЕ ЗАГРУЖЕННЫХ НАСТРОЕК К TouchProcessor ---
+            # Эти параметры устанавливаются после инициализации
+            if self.touch_processor:
+                self.touch_processor.touch_offset_x = self.default_touch_offset_x
+                self.touch_processor.touch_offset_y = self.default_touch_offset_y
+                self.touch_processor.enable_surface_detection(
+                    self.default_surface_filter_enabled
+                )
+                self.touch_processor.set_surface_detection_range(
+                    self.default_surface_min_offset, self.default_surface_max_offset
+                )
+                self.touch_processor.enable_flip_180(self.default_flip_180)
+                self.touch_processor.set_depth_offset(self.default_depth_offset)
+                self.touch_processor.set_depth_scale_factor(
+                    self.default_depth_scale_factor
+                )
+                # Устанавливаем Unity send включенным, если в настройках было так
+                if hasattr(self.touch_processor, "set_unity_send_enabled"):
+                    self.touch_processor.set_unity_send_enabled(
+                        self.default_unity_send_enabled
+                    )
+                self.touch_processor.set_min_touch_area(self.default_min_touch_area)
+                self.touch_processor.set_max_touch_area(self.default_max_touch_area)
+
+            # НАСТРАИВАЕМ ФИЛЬТРАЦИЮ ПО ГЛУБИНЕ (теперь с загруженными значениями)
             self.touch_processor.enable_depth_filter(self.depth_filter_enabled)
             self.touch_processor.set_depth_filter_range(
                 self.min_touch_depth, self.max_touch_depth
@@ -121,7 +353,6 @@ class TouchDetector:
             self.logger.info(
                 f"Диапазон глубины: {self.min_touch_depth:.2f}-{self.max_touch_depth:.2f}м"
             )
-
             # Инициализируем Unity коммуникацию
             self._init_unity_communication()
         else:
@@ -162,16 +393,42 @@ class TouchDetector:
 
     def _on_touch_offset_x_change(self, value: int) -> None:
         if self.touch_processor is not None:
-            offset_x = value - 50  # обратно в диапазон [-50, +50]
+            offset_x = value - 500  # обратно в диапазон [-50, +50]
             self.touch_processor.touch_offset_x = offset_x
             self.logger.debug(f"Смещение по X: {offset_x}")
             self._update_control_window()
 
     def _on_touch_offset_y_change(self, value: int) -> None:
         if self.touch_processor is not None:
-            offset_y = value - 50
+            offset_y = value - 500
             self.touch_processor.touch_offset_y = offset_y
             self.logger.debug(f"Смещение по Y: {offset_y}")
+            self._update_control_window()
+
+    def _on_surface_filter_toggle(self, value: int) -> None:
+        if self.touch_processor is not None:
+            enabled = bool(value)
+            self.touch_processor.enable_surface_detection(enabled)
+            self._update_control_window()
+
+    def _on_surface_min_offset_change(self, value: int) -> None:
+        if self.touch_processor is not None:
+            min_offset = (value - 1000) / 1000.0  # из мм в метры: 0→-1.0, 2000→+1.0
+            _, current_max = self.touch_processor.get_surface_detection_range()
+            if min_offset < current_max:
+                self.touch_processor.set_surface_detection_range(
+                    min_offset, current_max
+                )
+            self._update_control_window()
+
+    def _on_surface_max_offset_change(self, value: int) -> None:
+        if self.touch_processor is not None:
+            max_offset = (value - 50) / 1000.0
+            current_min, _ = self.touch_processor.get_surface_detection_range()
+            if max_offset > current_min:
+                self.touch_processor.set_surface_detection_range(
+                    current_min, max_offset
+                )
             self._update_control_window()
 
     def _setup_control_window(self) -> None:
@@ -182,7 +439,7 @@ class TouchDetector:
         cv2.namedWindow(self.control_window_name, cv2.WINDOW_AUTOSIZE)
 
         # Создаем информационное изображение для окна управления
-        control_image = np.zeros((500, 1000, 3), dtype=np.uint8)
+        control_image = np.zeros((500, 500, 3), dtype=np.uint8)
         cv2.putText(
             control_image,
             "Touch Detection Settings",
@@ -218,6 +475,50 @@ class TouchDetector:
             #     500,  # 0 до 500мм
             #     self._on_touch_threshold_change,
             # )
+
+            # Ползунок включения/выключения разворота на 180 градусов
+            flip_enabled = 1 if self.touch_processor.is_flip_180_enabled() else 0
+            cv2.createTrackbar(
+                "flip 180",
+                self.control_window_name,
+                flip_enabled,
+                1,
+                self._on_flip_180_toggle,
+            )
+
+            # Ползунок включения/выключения ограничения по поверхности
+            surface_filter_enabled = (
+                1 if self.touch_processor.is_surface_detection_enabled() else 0
+            )
+            cv2.createTrackbar(
+                "surface filter",
+                self.control_window_name,
+                surface_filter_enabled,
+                1,
+                self._on_surface_filter_toggle,
+            )
+
+            # Ползунок минимального отклонения (-1000 до +1000 мм → -1.0 до +1.0 м)
+            current_min_offset = int(
+                self.touch_processor.surface_min_offset * 1000
+            )  # в мм
+            cv2.createTrackbar(
+                "surf min offset (mm)",
+                self.control_window_name,
+                current_min_offset + 1000,  # смещение: -1000мм → 0
+                2000,  # диапазон: -1000..+1000 мм → 0..2000
+                self._on_surface_min_offset_change,
+            )
+
+            # Ползунок максимального отклонения (-50 до +200 мм → -0.05 до +0.2 м)
+            current_max_offset = int(self.touch_processor.surface_max_offset * 1000)
+            cv2.createTrackbar(
+                "surf max offset (mm)",
+                self.control_window_name,
+                current_max_offset + 50,  # смещение: -50мм → 0
+                500,  # диапазон: -50..+200 мм
+                self._on_surface_max_offset_change,
+            )
 
             # Ползунок для смещения глубины (-100 до +200 мм)
             current_depth_offset = int(self.touch_processor.get_depth_offset())
@@ -423,8 +724,8 @@ class TouchDetector:
             cv2.createTrackbar(
                 "touch offset X",
                 self.control_window_name,
-                current_offset_x + 250,  # Смещаем на 50, чтобы -50 → 0
-                500,  # Диапазон: 0..100 → -50..+50
+                current_offset_x + 500,  # Смещаем на 50, чтобы -50 → 0
+                1000,  # Диапазон: 0..100 → -50..+50
                 self._on_touch_offset_x_change,
             )
 
@@ -433,8 +734,8 @@ class TouchDetector:
             cv2.createTrackbar(
                 "touch offset Y",
                 self.control_window_name,
-                current_offset_y + 250,
-                500,
+                current_offset_y + 500,
+                1000,
                 self._on_touch_offset_y_change,
             )
 
@@ -685,6 +986,12 @@ class TouchDetector:
 
             self._update_control_window()
 
+    def _on_flip_180_toggle(self, value: int) -> None:
+        if self.touch_processor is not None:
+            enabled = bool(value)
+            self.touch_processor.enable_flip_180(enabled)
+            self._update_control_window()
+
     def _on_advanced_filter_toggle(self, value: int) -> None:
         """
         Callback для включения/выключения продвинутой фильтрации
@@ -772,6 +1079,40 @@ class TouchDetector:
             1,
         )
         y_pos += 25
+
+        cv2.putText(
+            control_image,
+            f"Flip 180: {'ON' if self.touch_processor.is_flip_180_enabled() else 'OFF'}",
+            (10, y_pos),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 165, 0),
+            1,
+        )
+        y_pos += 20
+
+        cv2.putText(
+            control_image,
+            f"Surface Filter: {'ON' if self.touch_processor.is_surface_detection_enabled() else 'OFF'}",
+            (10, y_pos),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 165, 0),
+            1,
+        )
+        y_pos += 20
+
+        min_off, max_off = self.touch_processor.get_surface_detection_range()
+        cv2.putText(
+            control_image,
+            f"Surface Range: {min_off*1000:.0f} to {max_off*1000:.0f} mm",
+            (10, y_pos),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 165, 0),
+            1,
+        )
+        y_pos += 20
 
         # Статус фильтрации
         filter_status = "ON" if self.depth_filter_enabled else "OFF"
@@ -1073,7 +1414,7 @@ class TouchDetector:
         ):
 
             # Проверяем, что клик в области обрезанного изображения (левая часть)
-            if x < 800:  # Ширина обрезанного изображения
+            if x < self.crop_width:  # Ширина обрезанного изображения
                 # Получаем текущие обрезанные изображения
                 if (
                     hasattr(self, "_last_cropped_depth")
@@ -1238,6 +1579,10 @@ class TouchDetector:
             cropped_color, cropped_depth = self.cropper.crop_both_images(
                 color_image, depth_image
             )
+            # Применяем разворот на 180 градусов, если включён
+            if self.touch_processor and self.touch_processor.is_flip_180_enabled():
+                cropped_color = cv2.rotate(cropped_color, cv2.ROTATE_180)
+                cropped_depth = cv2.rotate(cropped_depth, cv2.ROTATE_180)
 
             if cropped_color is not None and cropped_depth is not None:
                 # Применяем цветовую карту к обрезанному изображению глубины
@@ -1470,6 +1815,7 @@ class TouchDetector:
                 "3/4 - increase/decrease max depth",  # НОВАЯ КОМАНДА
                 "5 - auto set depth range",  # НОВАЯ КОМАНДА
                 "Q - exit program",
+                "I - flip image 180°",
             ]
 
         y_offset = images.shape[0] // 2 - 100
@@ -1716,7 +2062,9 @@ class TouchDetector:
         if calibration_success:
             self.logger.info("Калибровка завершена успешно")
             # Перезагружаем cropper с новыми данными калибровки
-            self.cropper = ProjectionAreaCropper(output_size=(800, 600))
+            self.cropper = ProjectionAreaCropper(
+                output_size=(self.crop_width, self.crop_height)
+            )
             if self.cropper.is_calibrated:
                 self.logger.info("Обрезчик проекции обновлен с новой калибровкой")
                 # Переинициализируем процессор касаний
@@ -1829,6 +2177,13 @@ class TouchDetector:
                         self.logger.info(
                             f"Минимальная глубина увеличена до: {self.min_touch_depth:.2f}м"
                         )
+
+            elif key == ord("i"):
+                if self.touch_processor is not None:
+                    new_state = not self.touch_processor.is_flip_180_enabled()
+                    self.touch_processor.enable_flip_180(new_state)
+                    status = "включён" if new_state else "выключён"
+                    self.logger.info(f"Разворот изображения на 180° {status}")
 
             elif key == ord("2"):  # Уменьшить минимальную глубину
                 if self.touch_processor is not None:
